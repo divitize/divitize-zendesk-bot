@@ -2,6 +2,26 @@ import os, re, time, requests
 from typing import List, Dict, Any
 from openai import OpenAI
 
+# --- keep-alive HTTP server for Render (Flask) ---
+from threading import Thread
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.get("/")
+def root():
+    return "OK"
+
+@app.get("/healthz")
+def healthz():
+    return "ok"
+
+def run_http():
+    # Render imposta PORT; fallback 10000
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+# --- end keep-alive block ---
+
 # ====== ENV ======
 Z_SUBDOMAIN   = os.getenv("ZENDESK_SUBDOMAIN")         # es: divitize
 Z_EMAIL       = os.getenv("ZENDESK_EMAIL")             # es: divitize.info@gmail.com
@@ -174,4 +194,7 @@ def main():
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
+    # Avvia un mini server HTTP per tenere aperta la porta su Render
+    Thread(target=run_http, daemon=True).start()
+    # Avvia il loop del bot
     main()
