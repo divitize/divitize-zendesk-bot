@@ -1,32 +1,16 @@
-import os, re, time, requests
+import os, re, time, threading, requests
 from typing import List, Dict, Any
 from openai import OpenAI
 
-# --- keep-alive HTTP server for Render (Flask) ---
-from threading import Thread
-from flask import Flask
+from flask import Flask, jsonify
 
-app = Flask(__name__)
-
-@app.get("/")
-def root():
-    return "OK"
-
-@app.get("/healthz")
-def healthz():
-    return "ok"
-
-def run_http():
-    # Render imposta PORT; fallback 10000
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
-# --- end keep-alive block ---
-
-# ====== ENV ======
-Z_SUBDOMAIN   = os.getenv("ZENDESK_SUBDOMAIN")         # es: divitize
-Z_EMAIL       = os.getenv("ZENDESK_EMAIL")             # es: divitize.info@gmail.com
-Z_API_TOKEN   = os.getenv("ZENDESK_API_TOKEN")         # token Zendesk
-OPENAI_APIKEY = os.getenv("OPENAI_API_KEY")            # sk-...
+# =========================
+#        ENV VARS
+# =========================
+Z_SUBDOMAIN   = os.getenv("ZENDESK_SUBDOMAIN")           # es: divitize
+Z_EMAIL       = os.getenv("ZENDESK_EMAIL")               # es: divitize.info@gmail.com
+Z_API_TOKEN   = os.getenv("ZENDESK_API_TOKEN")
+OPENAI_APIKEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 BRAND_NAME     = os.getenv("BRAND_NAME", "Divitize")
@@ -36,10 +20,17 @@ DRAFT_TAG      = os.getenv("DRAFT_TAG", "chat_suggested_draft")
 
 RETURN_SENTENCE = os.getenv(
     "RETURN_SENTENCE",
-    "Please don’t worry about the current insert—you don’t need to return it. We’ll take care of everything so you can simply enjoy your upgraded organizer."
+    "Please don’t worry about the current insert—you don’t need to return it. "
+    "We’ll take care of everything so you can simply enjoy your upgraded organizer."
 )
 
-# ====== ZENDESK REST ======
+# (opzionale) URL pubblico del servizio per auto-ping keep-alive (es: https://divitize-zendesk-bot.onrender.com/healthz)
+SELF_URL       = os.getenv("SELF_URL")
+KEEPALIVE_EVERY_MIN = int(os.getenv("KEEPALIVE_MIN", "9"))  # ping ogni 9 min
+
+# =========================
+#        ZENDESK REST
+# =========================
 Z_BASE = f"https://{Z_SUBDOMAIN}.zendesk.com/api/v2"
 AUTH   = (f"{Z_EMAIL}/token", Z_API_TOKEN)
 
@@ -54,7 +45,11 @@ def z_put(path, payload):
     return r.json()
 
 def list_recent_tickets(limit=40):
-    return z_get("/tickets.json", {"sort_by":"updated_at","sort_order":"desc","per_page":limit}).get("tickets", [])
+    return z_get("/tickets.json", {
+        "sort_by": "updated_at",
+        "sort_order": "desc",
+        "per_page": limit
+    }).get("tickets", [])
 
 def get_ticket_comments(ticket_id: int):
     return z_get(f"/tickets/{ticket_id}/comments.json").get("comments", [])
@@ -63,16 +58,20 @@ def add_internal_note_and_tag(ticket_id: int, note: str, tag: str):
     payload = {"ticket": {"comment": {"public": False, "body": note}, "additional_tags": [tag]}}
     z_put(f"/tickets/{ticket_id}.json", payload)
 
-# ====== HEURISTICS ======
+# =========================
+#      HEURISTICHE
+# =========================
 ORDER_PAT = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")
 
 def extract_order_number(text: str) -> str | None:
-    if not text: return None
+    if not text:
+        return None
     m = ORDER_PAT.search(text.replace("\n"," "))
     return m.group(0) if m else None
 
 def last_is_end_user_public(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> bool:
-    if not comments: return False
+    if not comments:
+        return False
     last = comments[-1]
     return last.get("public") and last.get("author_id") == ticket.get("requester_id")
 
@@ -82,15 +81,18 @@ def message_has_photo(comment: Dict[str,Any]) -> bool:
 def is_request_explicit(text: str) -> bool:
     if not text: return False
     t = text.lower()
-    triggers = ["i want","please send","replace with","i would rather have","instead"]
-    colors   = ["black","white","brown","dark brown","beige","sienna","red","blue","navy","tan","camel","cream","ivory","pink","green","grey","gray","chocolate"]
+    triggers = ["i want", "please send", "replace with", "i would rather have", "instead"]
+    colors   = ["black","white","brown","dark brown","beige","sienna","red","blue","navy",
+                "tan","camel","cream","ivory","pink","green","grey","gray","chocolate"]
     sizes    = ["mini","small","medium","large","xl","vanity","pm","mm","gm","bb","nano","micro"]
     return (any(k in t for k in triggers) and (any(c in t for c in colors) or any(s in t for s in sizes)))
 
-# ====== PROMPT ======
-SYSTEM_RULES = """
-You are {sig}, the customer service agent for {brand}.
-Tone: warm, polite, professional, crystal-clear. Always sign as '{sig}'.
+# =========================
+#         PROMPT
+# =========================
+SYSTEM_RULES = f"""
+You are {SIGNATURE_NAME}, the customer service agent for {BRAND_NAME}.
+Tone: warm, polite, professional, crystal-clear. Always sign as '{SIGNATURE_NAME}'.
 Write in the customer’s language if obvious; otherwise use English.
 
 Rules:
@@ -101,14 +103,15 @@ Rules:
 - Color:
   * If customer clearly prefers another color, do NOT ask for photos. Confirm replacement and mention tracking. Echo color/bag if known.
   * If it’s a shade/match question, ask for a picture of the organizer inside the bag to pick a better shade.
-- If request is explicit (specific color/size), be brief and direct (no long preamble). Include reassurance about no return and mention tracking.
+- If request is explicit (specific color/size), be brief and direct (no long preamble). Mention that you’ll share the tracking as soon as available.
 - Otherwise, ask ONLY minimal missing info:
   - "Could you please confirm the exact model name of your bag, or share a direct link to the one you own?"
   - If missing: "May I kindly ask you to provide your Amazon order number so I can quickly locate your purchase?"
-- Include this reassurance when appropriate: "{no_return}"
+- Add this reassurance ONLY when it helps reduce a return for sizing/color/material cases:
+  "{RETURN_SENTENCE}"
 - Never overpromise; say you'll share the tracking as soon as available.
-- Sign as '{sig}'.
-""".format(sig=SIGNATURE_NAME, brand=BRAND_NAME, no_return=RETURN_SENTENCE)
+- Sign as '{SIGNATURE_NAME}'.
+"""
 
 def classify_intent(client: OpenAI, model: str, text: str) -> str:
     try:
@@ -121,7 +124,7 @@ def classify_intent(client: OpenAI, model: str, text: str) -> str:
                  "Message:\n"+(text or "")}
             ]
         )
-        return r.choices[0].message.content.strip()
+        return (r.choices[0].message.content or "Generic/Other").strip()
     except Exception:
         return "Generic/Other"
 
@@ -149,20 +152,26 @@ def compose_draft(client: OpenAI, model: str, ticket: Dict[str,Any], comments: L
             {"role":"system","content": SYSTEM_RULES},
             {"role":"user","content":
              "Write the final reply for the customer now. "
-             "If explicit_request=True keep it short (confirm + reassurance + tracking). "
+             "If explicit_request=True keep it short (confirm + tracking soon). "
              "Else ask only minimal missing info. "
              f"Context:\n{context}\nSign as {SIGNATURE_NAME}."}
         ]
     )
-    msg = r.choices[0].message.content.strip()
+    msg = (r.choices[0].message.content or "").strip()
     if SIGNATURE_NAME not in msg:
         msg += f"\n\nBest regards,\n{SIGNATURE_NAME}"
     return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
-# ====== LOOP ======
-def process_once(client: OpenAI):
-    for t in list_recent_tickets():
-        if t.get("status") in ("solved","closed"): 
+# =========================
+#      POLLING LOGIC
+# =========================
+_client = None
+_thread_started = False
+
+def process_once():
+    tickets = list_recent_tickets()
+    for t in tickets:
+        if t.get("status") in ("solved","closed"):
             continue
         if DRAFT_TAG in (t.get("tags") or []):
             continue
@@ -172,13 +181,52 @@ def process_once(client: OpenAI):
             continue
 
         try:
-            draft = compose_draft(client, OPENAI_MODEL, t, comments)
+            draft = compose_draft(_client, OPENAI_MODEL, t, comments)
             add_internal_note_and_tag(t["id"], draft, DRAFT_TAG)
             print(f"[OK] Draft created for ticket {t['id']}")
         except Exception as e:
-            print(f"[ERROR] {t['id']}: {e}")
+            print(f"[ERROR] ticket {t.get('id')}: {e}")
 
-def main():
+def poll_loop():
+    print(f"{BRAND_NAME} — Draft Assistant running as {SIGNATURE_NAME} (poll {POLL_INTERVAL}s)")
+    last_keepalive = 0
+    while True:
+        try:
+            process_once()
+        except Exception as e:
+            print(f"[LOOP ERROR] {e}")
+
+        # keep-alive opzionale
+        if SELF_URL:
+            now = time.time()
+            if now - last_keepalive > KEEPALIVE_EVERY_MIN * 60:
+                try:
+                    requests.get(SELF_URL, timeout=10)
+                    print("[keepalive] pinged", SELF_URL)
+                except Exception as e:
+                    print("[keepalive error]", e)
+                last_keepalive = now
+
+        time.sleep(POLL_INTERVAL)
+
+# =========================
+#        FLASK APP
+# =========================
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Divitize Zendesk Draft Assistant — running.\n"
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True})
+
+def start_background_if_needed():
+    global _thread_started, _client
+    if _thread_started:
+        return
+    # check env
     missing = [k for k,v in {
         "ZENDESK_SUBDOMAIN":Z_SUBDOMAIN,
         "ZENDESK_EMAIL":Z_EMAIL,
@@ -187,14 +235,19 @@ def main():
     }.items() if not v]
     if missing:
         raise SystemExit("Missing env vars: " + ", ".join(missing))
-    client = OpenAI(api_key=OPENAI_APIKEY)
-    print(f"{BRAND_NAME} — Draft Assistant running as {SIGNATURE_NAME} (poll {POLL_INTERVAL}s)")
-    while True:
-        process_once(client)
-        time.sleep(POLL_INTERVAL)
 
+    _client = OpenAI(api_key=OPENAI_APIKEY)
+    t = threading.Thread(target=poll_loop, daemon=True)
+    t.start()
+    _thread_started = True
+    print("[BG] polling thread started")
+
+# Render lancia questo file con `python bot_zendesk.py`
 if __name__ == "__main__":
-    # Avvia un mini server HTTP per tenere aperta la porta su Render
-    Thread(target=run_http, daemon=True).start()
-    # Avvia il loop del bot
-    main()
+    # avvia il thread di polling
+    start_background_if_needed()
+
+    # avvia Flask su PORT (Render la setta)
+    port = int(os.getenv("PORT", "10000"))
+    # debug False in produzione
+    app.run(host="0.0.0.0", port=port, debug=False)
