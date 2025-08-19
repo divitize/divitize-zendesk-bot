@@ -1,16 +1,13 @@
 import os, re, time, threading, requests
 from typing import List, Dict, Any
+from flask import Flask, jsonify
 from openai import OpenAI
 
-from flask import Flask, jsonify
-
-# =========================
-#        ENV VARS
-# =========================
-Z_SUBDOMAIN   = os.getenv("ZENDESK_SUBDOMAIN")           # es: divitize
-Z_EMAIL       = os.getenv("ZENDESK_EMAIL")               # es: divitize.info@gmail.com
-Z_API_TOKEN   = os.getenv("ZENDESK_API_TOKEN")
-OPENAI_APIKEY = os.getenv("OPENAI_API_KEY")
+# ====== ENV ======
+Z_SUBDOMAIN   = os.getenv("ZENDESK_SUBDOMAIN")         # es: divitize
+Z_EMAIL       = os.getenv("ZENDESK_EMAIL")             # es: divitize.info@gmail.com
+Z_API_TOKEN   = os.getenv("ZENDESK_API_TOKEN")         # token Zendesk
+OPENAI_APIKEY = os.getenv("OPENAI_API_KEY")            # sk-...
 OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 BRAND_NAME     = os.getenv("BRAND_NAME", "Divitize")
@@ -20,17 +17,10 @@ DRAFT_TAG      = os.getenv("DRAFT_TAG", "chat_suggested_draft")
 
 RETURN_SENTENCE = os.getenv(
     "RETURN_SENTENCE",
-    "Please don’t worry about the current insert—you don’t need to return it. "
-    "We’ll take care of everything so you can simply enjoy your upgraded organizer."
+    "Please don’t worry about the current insert—you don’t need to return it. We’ll take care of everything so you can simply enjoy your upgraded organizer."
 )
 
-# (opzionale) URL pubblico del servizio per auto-ping keep-alive (es: https://divitize-zendesk-bot.onrender.com/healthz)
-SELF_URL       = os.getenv("SELF_URL")
-KEEPALIVE_EVERY_MIN = int(os.getenv("KEEPALIVE_MIN", "9"))  # ping ogni 9 min
-
-# =========================
-#        ZENDESK REST
-# =========================
+# ====== ZENDESK REST ======
 Z_BASE = f"https://{Z_SUBDOMAIN}.zendesk.com/api/v2"
 AUTH   = (f"{Z_EMAIL}/token", Z_API_TOKEN)
 
@@ -45,6 +35,7 @@ def z_put(path, payload):
     return r.json()
 
 def list_recent_tickets(limit=40):
+    # Gli updated più recenti per essere “attenti” ai nuovi messaggi
     return z_get("/tickets.json", {
         "sort_by": "updated_at",
         "sort_order": "desc",
@@ -58,20 +49,16 @@ def add_internal_note_and_tag(ticket_id: int, note: str, tag: str):
     payload = {"ticket": {"comment": {"public": False, "body": note}, "additional_tags": [tag]}}
     z_put(f"/tickets/{ticket_id}.json", payload)
 
-# =========================
-#      HEURISTICHE
-# =========================
+# ====== HEURISTICS ======
 ORDER_PAT = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")
 
 def extract_order_number(text: str) -> str | None:
-    if not text:
-        return None
+    if not text: return None
     m = ORDER_PAT.search(text.replace("\n"," "))
     return m.group(0) if m else None
 
 def last_is_end_user_public(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> bool:
-    if not comments:
-        return False
+    if not comments: return False
     last = comments[-1]
     return last.get("public") and last.get("author_id") == ticket.get("requester_id")
 
@@ -81,18 +68,15 @@ def message_has_photo(comment: Dict[str,Any]) -> bool:
 def is_request_explicit(text: str) -> bool:
     if not text: return False
     t = text.lower()
-    triggers = ["i want", "please send", "replace with", "i would rather have", "instead"]
-    colors   = ["black","white","brown","dark brown","beige","sienna","red","blue","navy",
-                "tan","camel","cream","ivory","pink","green","grey","gray","chocolate"]
+    triggers = ["i want","please send","replace with","i would rather have","instead"]
+    colors   = ["black","white","brown","dark brown","beige","sienna","red","blue","navy","tan","camel","cream","ivory","pink","green","grey","gray","chocolate"]
     sizes    = ["mini","small","medium","large","xl","vanity","pm","mm","gm","bb","nano","micro"]
     return (any(k in t for k in triggers) and (any(c in t for c in colors) or any(s in t for s in sizes)))
 
-# =========================
-#         PROMPT
-# =========================
-SYSTEM_RULES = f"""
-You are {SIGNATURE_NAME}, the customer service agent for {BRAND_NAME}.
-Tone: warm, polite, professional, crystal-clear. Always sign as '{SIGNATURE_NAME}'.
+# ====== PROMPT ======
+SYSTEM_RULES = """
+You are {sig}, the customer service agent for {brand}.
+Tone: warm, polite, professional, crystal-clear. Always sign as '{sig}'.
 Write in the customer’s language if obvious; otherwise use English.
 
 Rules:
@@ -103,15 +87,14 @@ Rules:
 - Color:
   * If customer clearly prefers another color, do NOT ask for photos. Confirm replacement and mention tracking. Echo color/bag if known.
   * If it’s a shade/match question, ask for a picture of the organizer inside the bag to pick a better shade.
-- If request is explicit (specific color/size), be brief and direct (no long preamble). Mention that you’ll share the tracking as soon as available.
+- If request is explicit (specific color/size), be brief and direct (no long preamble). Include reassurance about no return and mention tracking.
 - Otherwise, ask ONLY minimal missing info:
   - "Could you please confirm the exact model name of your bag, or share a direct link to the one you own?"
   - If missing: "May I kindly ask you to provide your Amazon order number so I can quickly locate your purchase?"
-- Add this reassurance ONLY when it helps reduce a return for sizing/color/material cases:
-  "{RETURN_SENTENCE}"
+- Include this reassurance when appropriate: "{no_return}"
 - Never overpromise; say you'll share the tracking as soon as available.
-- Sign as '{SIGNATURE_NAME}'.
-"""
+- Sign as '{sig}'.
+""".format(sig=SIGNATURE_NAME, brand=BRAND_NAME, no_return=RETURN_SENTENCE)
 
 def classify_intent(client: OpenAI, model: str, text: str) -> str:
     try:
@@ -124,7 +107,7 @@ def classify_intent(client: OpenAI, model: str, text: str) -> str:
                  "Message:\n"+(text or "")}
             ]
         )
-        return (r.choices[0].message.content or "Generic/Other").strip()
+        return r.choices[0].message.content.strip()
     except Exception:
         return "Generic/Other"
 
@@ -152,102 +135,100 @@ def compose_draft(client: OpenAI, model: str, ticket: Dict[str,Any], comments: L
             {"role":"system","content": SYSTEM_RULES},
             {"role":"user","content":
              "Write the final reply for the customer now. "
-             "If explicit_request=True keep it short (confirm + tracking soon). "
+             "If explicit_request=True keep it short (confirm + reassurance + tracking). "
              "Else ask only minimal missing info. "
              f"Context:\n{context}\nSign as {SIGNATURE_NAME}."}
         ]
     )
-    msg = (r.choices[0].message.content or "").strip()
+    msg = r.choices[0].message.content.strip()
     if SIGNATURE_NAME not in msg:
         msg += f"\n\nBest regards,\n{SIGNATURE_NAME}"
     return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
-# =========================
-#      POLLING LOGIC
-# =========================
-_client = None
-_thread_started = False
+# ====== SKIP LOGIC MIGLIORATA ======
+def last_internal_after_last_user(comments: List[Dict[str, Any]], requester_id: int) -> bool:
+    last_user_idx = -1
+    last_internal_idx = -1
+    for i, c in enumerate(comments):
+        if c.get("public") and c.get("author_id") == requester_id:
+            last_user_idx = i
+        if not c.get("public"):
+            last_internal_idx = i
+    return last_internal_idx > last_user_idx
+
+def why_skip(ticket: Dict[str, Any], comments: List[Dict[str, Any]], draft_tag: str) -> str | None:
+    if ticket.get("status") in ("solved", "closed"):
+        return "status solved/closed"
+    if not comments:
+        return "no comments"
+    last = comments[-1]
+    if not (last.get("public") and last.get("author_id") == ticket.get("requester_id")):
+        return "last is not end-user public"
+    # se c'è il tag MA il cliente ha scritto dopo l'ultima nota interna => NON skip
+    has_tag = draft_tag in (ticket.get("tags") or [])
+    if has_tag and not last_internal_after_last_user(comments, ticket.get("requester_id")):
+        return f"tag '{draft_tag}' still present and last internal after last user"
+    return None
+
+# ====== POLLING LOOP ======
+client = OpenAI(api_key=OPENAI_APIKEY)
 
 def process_once():
-    tickets = list_recent_tickets()
-    for t in tickets:
-        if t.get("status") in ("solved","closed"):
-            continue
-        if DRAFT_TAG in (t.get("tags") or []):
+    for t in list_recent_tickets():
+        try:
+            comments = get_ticket_comments(t["id"])
+        except Exception as e:
+            print(f"[ERROR] get_comments {t.get('id')}: {e}")
             continue
 
-        comments = get_ticket_comments(t["id"])
-        if not comments or not last_is_end_user_public(t, comments):
+        skip_reason = why_skip(t, comments, DRAFT_TAG)
+        if skip_reason:
+            print(f"[SKIP] Ticket {t['id']}: {skip_reason}")
             continue
 
         try:
-            draft = compose_draft(_client, OPENAI_MODEL, t, comments)
+            draft = compose_draft(client, OPENAI_MODEL, t, comments)
             add_internal_note_and_tag(t["id"], draft, DRAFT_TAG)
             print(f"[OK] Draft created for ticket {t['id']}")
         except Exception as e:
-            print(f"[ERROR] ticket {t.get('id')}: {e}")
+            print(f"[ERROR] {t['id']}: {e}")
 
-def poll_loop():
-    print(f"{BRAND_NAME} — Draft Assistant running as {SIGNATURE_NAME} (poll {POLL_INTERVAL}s)")
-    last_keepalive = 0
+def poll_forever():
+    print(f"[BG] polling thread started (interval {POLL_INTERVAL}s)")
     while True:
         try:
+            print("[BG] tick")
             process_once()
         except Exception as e:
-            print(f"[LOOP ERROR] {e}")
-
-        # keep-alive opzionale
-        if SELF_URL:
-            now = time.time()
-            if now - last_keepalive > KEEPALIVE_EVERY_MIN * 60:
-                try:
-                    requests.get(SELF_URL, timeout=10)
-                    print("[keepalive] pinged", SELF_URL)
-                except Exception as e:
-                    print("[keepalive error]", e)
-                last_keepalive = now
-
+            print(f"[BG][ERROR] {e}")
         time.sleep(POLL_INTERVAL)
 
-# =========================
-#        FLASK APP
-# =========================
+# ====== FLASK (health) + AVVIO THREAD ======
 app = Flask(__name__)
-
-@app.route("/")
-def index():
-    return "Divitize Zendesk Draft Assistant — running.\n"
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({"ok": True})
+    return jsonify(ok=True, service="divitize-zendesk-bot")
 
-def start_background_if_needed():
-    global _thread_started, _client
-    if _thread_started:
-        return
-    # check env
-    missing = [k for k,v in {
-        "ZENDESK_SUBDOMAIN":Z_SUBDOMAIN,
-        "ZENDESK_EMAIL":Z_EMAIL,
-        "ZENDESK_API_TOKEN":Z_API_TOKEN,
-        "OPENAI_API_KEY":OPENAI_APIKEY
-    }.items() if not v]
-    if missing:
-        raise SystemExit("Missing env vars: " + ", ".join(missing))
+# Avvia il thread al boot del processo
+thread_started = False
 
-    _client = OpenAI(api_key=OPENAI_APIKEY)
-    t = threading.Thread(target=poll_loop, daemon=True)
-    t.start()
-    _thread_started = True
-    print("[BG] polling thread started")
+def start_background_once():
+    global thread_started
+    if not thread_started:
+        th = threading.Thread(target=poll_forever, daemon=True)
+        th.start()
+        thread_started = True
 
-# Render lancia questo file con `python bot_zendesk.py`
+# Render/Flask entrypoint
+@app.before_first_request
+def _before_first_request():
+    start_background_once()
+
+# In alcuni ambienti è utile far partire subito
+start_background_once()
+
 if __name__ == "__main__":
-    # avvia il thread di polling
-    start_background_if_needed()
-
-    # avvia Flask su PORT (Render la setta)
     port = int(os.getenv("PORT", "10000"))
-    # debug False in produzione
+    print(f"{BRAND_NAME} — Draft Assistant running as {SIGNATURE_NAME} (poll {POLL_INTERVAL}s)")
     app.run(host="0.0.0.0", port=port, debug=False)
