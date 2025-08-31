@@ -63,6 +63,23 @@ def add_public_reply_and_tags(ticket_id: int, body: str, tags: List[str], set_st
         t["status"] = set_status
     z_put(f"/tickets/{ticket_id}.json", {"ticket": t})
 
+# NEW: leggere i tag effettivi del ticket
+def get_ticket_tags(ticket_id: int) -> List[str]:
+    try:
+        t = z_get(f"/tickets/{ticket_id}.json").get("ticket", {})
+        return list(t.get("tags") or [])
+    except Exception:
+        return []
+
+# NEW: forzare i tag scrivendoli nel campo 'tags' (merge con esistenti)
+def ensure_tags(ticket_id: int, new_tags: List[str]):
+    try:
+        existing = get_ticket_tags(ticket_id)
+        merged = sorted(set((existing or []) + (new_tags or [])))
+        z_put(f"/tickets/{ticket_id}.json", {"ticket": {"tags": merged}})
+    except Exception as e:
+        print(f"[WARN] ensure_tags failed on {ticket_id}: {e}")
+
 def get_user_first_name(user_id: int) -> str:
     try:
         u = z_get(f"/users/{user_id}.json").get("user", {})
@@ -113,6 +130,13 @@ def thread_has_any_photo(comments: List[Dict[str, Any]]) -> bool:
         for a in (c.get("attachments") or []):
             if (a.get("content_type","").startswith(("image/","application/pdf"))):
                 return True
+    return False
+
+# NEW: foto nell’ultimo messaggio
+def message_has_photo(comment: Dict[str, Any]) -> bool:
+    for a in (comment.get("attachments") or []):
+        if (a.get("content_type","").startswith(("image/","application/pdf"))):
+            return True
     return False
 
 def detect_chain_case(text: str) -> Optional[Dict[str, Any]]:
@@ -292,8 +316,8 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
     """
     Se c'è tracking:
       - Se l'ultimo pubblico contiene già il tracking → retro-tag (replacement_sent + guard) e STOP.
-      - Se c'è già il guard tag → STOP.
-      - Altrimenti invia messaggio pubblico + status Solved + aggiunge (replacement_sent + guard).
+      - Se c'è già il guard tag → STOP (non spammare).
+      - Altrimenti invia messaggio pubblico + status Solved + forza (replacement_sent + guard) nei tag.
     Ritorna True se ha fatto qualcosa (pubblicato o retro-taggato).
     """
     ticket_id = ticket["id"]
@@ -303,26 +327,24 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
         return False
 
     guard = tracking_guard_tag(tracking)
+    wanted_tags = [TAG_REPLACEMENT_SENT, guard]
 
     # Se già presente il messaggio (inviato manualmente o prima): retro-tag e fine
     comments = get_ticket_comments(ticket_id)
     if last_public_comment_contains_tracking(comments, tracking):
-        if guard not in tags or TAG_REPLACEMENT_SENT not in tags:
-            try:
-                z_put(f"/tickets/{ticket_id}.json", {"ticket": {"additional_tags": list({TAG_REPLACEMENT_SENT, guard})}})
-                print(f"[OK] Retro-tag guard added on ticket {ticket_id}")
-            except Exception as e:
-                print(f"[WARN] retro-tag {ticket_id}: {e}")
+        ensure_tags(ticket_id, wanted_tags)  # forza su 'tags'
+        print(f"[OK] Retro-tag guard + replacement_sent on ticket {ticket_id}")
         return True
 
     # Se già taggato per questo tracking → non spammare
     if guard in tags:
         return False
 
-    # Invia una sola volta
+    # Invia una sola volta (pubblico) + Solved + forza i tag
     body = build_public_tracking_message(tracking)
-    add_public_reply_and_tags(ticket_id, body, [TAG_REPLACEMENT_SENT, guard], set_status="solved")
-    print(f"[OK] Tracking published + solved for ticket {ticket_id}")
+    add_public_reply_and_tags(ticket_id, body, wanted_tags, set_status="solved")
+    ensure_tags(ticket_id, wanted_tags)
+    print(f"[OK] Tracking published + solved + tags forced for ticket {ticket_id}")
     return True
 
 # ============ CICLO PRINCIPALE ============
