@@ -10,7 +10,7 @@ Z_EMAIL       = os.getenv("ZENDESK_EMAIL", "").strip()
 Z_API_TOKEN   = os.getenv("ZENDESK_API_TOKEN", "").strip()
 
 OPENAI_APIKEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # tenuto per eventuali futuri usi
 
 BRAND_NAME     = os.getenv("BRAND_NAME", "Divitize").strip()
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Noe").strip()
@@ -18,11 +18,20 @@ SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Noe").strip()
 POLL_INTERVAL  = int(os.getenv("POLL_INTERVAL_SEC", "35"))
 DRAFT_TAG      = os.getenv("DRAFT_TAG", "chat_suggested_draft").strip()
 
-# Custom field id for tracking (string ok)
-Z_TRACKING_FIELD = os.getenv("Z_TRACKING_FIELD", "").strip()   # es: "29120306162322"
+# Custom field id per tracking (string ok; es: "29120306162322")
+Z_TRACKING_FIELD = os.getenv("Z_TRACKING_FIELD", "").strip()
 
-# Tags
-TAG_REPLACEMENT_SENT = "replacement_sent"  # usato anche dalla tua automazione 21/28gg
+# Tags fissi
+TAG_REPLACEMENT_SENT = "replacement_sent"                 # usato per automazione review
+TRACKING_SENT_PREFIX = "tracking_sent_"                   # guard anti-spam per singolo tracking
+
+# Origine — token subject Amazon-QR (deterministico)
+AMAZON_SUBJECT_TOKENS = [
+    s.strip().lower() for s in os.getenv(
+        "AMAZON_SUBJECT_TOKENS",
+        "free replacement for my amazon purchase"
+    ).split(",") if s.strip()
+]
 
 # ============ MESSAGGI FISSI ============
 NO_RETURN_SENTENCE = (
@@ -63,7 +72,7 @@ def add_public_reply_and_tags(ticket_id: int, body: str, tags: List[str], set_st
         t["status"] = set_status
     z_put(f"/tickets/{ticket_id}.json", {"ticket": t})
 
-# NEW: leggere i tag effettivi del ticket
+# ====== Tags utilities ======
 def get_ticket_tags(ticket_id: int) -> List[str]:
     try:
         t = z_get(f"/tickets/{ticket_id}.json").get("ticket", {})
@@ -71,8 +80,8 @@ def get_ticket_tags(ticket_id: int) -> List[str]:
     except Exception:
         return []
 
-# NEW: forzare i tag scrivendoli nel campo 'tags' (merge con esistenti)
 def ensure_tags(ticket_id: int, new_tags: List[str]):
+    """Unisce e forza i tag nel campo 'tags' del ticket (sidebar/automazioni affidabili)."""
     try:
         existing = get_ticket_tags(ticket_id)
         merged = sorted(set((existing or []) + (new_tags or [])))
@@ -80,6 +89,18 @@ def ensure_tags(ticket_id: int, new_tags: List[str]):
     except Exception as e:
         print(f"[WARN] ensure_tags failed on {ticket_id}: {e}")
 
+def remove_tags(ticket_id: int, tags_to_remove: List[str]):
+    """Rimuove in modo esplicito alcuni tag dal campo 'tags'."""
+    if not tags_to_remove:
+        return
+    try:
+        existing = get_ticket_tags(ticket_id)
+        target = sorted([t for t in (existing or []) if t not in set(tags_to_remove)])
+        z_put(f"/tickets/{ticket_id}.json", {"ticket": {"tags": target}})
+    except Exception as e:
+        print(f"[WARN] remove_tags failed on {ticket_id}: {e}")
+
+# ====== Helper nome utente ======
 def get_user_first_name(user_id: int) -> str:
     try:
         u = z_get(f"/users/{user_id}.json").get("user", {})
@@ -88,6 +109,7 @@ def get_user_first_name(user_id: int) -> str:
     except Exception:
         return "there"
 
+# ====== Campi custom ======
 def get_custom_field_value(ticket: Dict[str, Any], field_id: str) -> Optional[str]:
     for f in (ticket.get("custom_fields") or []):
         if str(f.get("id")) == str(field_id):
@@ -95,13 +117,14 @@ def get_custom_field_value(ticket: Dict[str, Any], field_id: str) -> Optional[st
             return str(v).strip() if v else None
     return None
 
-# ============ HEURISTICHE ============
-ORDER_PAT = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")
+# ============ HEURISTICHE DI TESTO ============
+ORDER_PAT = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")  # Amazon order
 URL_PAT = re.compile(r'https?://[^\s)>\]]+', re.I)
 MEASURES_PAT = re.compile(
     r'\b(\d{1,2}(\.\d{1,2})?)\s*[x×]\s*(\d{1,2}(\.\d{1,2})?)\s*[x×]\s*(\d{1,2}(\.\d{1,2})?)\b',
     re.I
 )
+SHOPIFY_CONTACT_PHRASE = "you received a new message from your online store's contact form"
 
 COLOR_WORDS = {"black","white","brown","dark brown","beige","sienna","red","blue","navy","tan","camel",
                "cream","ivory","pink","green","grey","gray","chocolate","gold","silver"}
@@ -109,6 +132,11 @@ CHAIN_WORDS = {"chain","strap","shoulder strap","tracolla","catena","belt"}
 SHORT_WORDS = {"short","too short","shorter","più corta","piu corta"}
 LONG_WORDS  = {"long","too long","longer","più lunga","piu lunga"}
 SIZE_WORDS  = {"mini","small","medium","large","xl","vanity","pm","mm","gm","bb","nano","micro"}
+
+PRE_SALE_MATERIAL_TRIGGERS = {"thinner","thin","sottile","silk","nylon","felt","material","soft","morbido","rigido","stiff"}
+PRE_SALE_CUSTOM_TRIGGERS   = {"custom"," misura","misure","dimension","size","sizing","fit","fits","su misura","tailor","bespoke"}
+
+POSITIVE_WORDS = {"love","favourite","favorite","amazing","wonderful","best of all time","i adore","grazie mille","thank you so much","your organizers are my favorite"}
 
 def contains_any(text: str, vocab: set) -> bool:
     t = (text or "").lower()
@@ -132,7 +160,6 @@ def thread_has_any_photo(comments: List[Dict[str, Any]]) -> bool:
                 return True
     return False
 
-# NEW: foto nell’ultimo messaggio
 def message_has_photo(comment: Dict[str, Any]) -> bool:
     for a in (comment.get("attachments") or []):
         if (a.get("content_type","").startswith(("image/","application/pdf"))):
@@ -156,52 +183,82 @@ def detect_chain_case(text: str) -> Optional[Dict[str, Any]]:
 def is_explicit_request(text: str) -> bool:
     if not text: return False
     t = text.lower()
-    triggers = ["i want","please send","replace","i would rather have","instead","can you send","please ship"]
+    triggers = ["i want","please send","replace","i would rather have","instead","can you send","please ship","i prefer","i'd like","i would like"]
     return any(k in t for k in triggers) and (
         contains_any(t, SIZE_WORDS) or contains_any(t, COLOR_WORDS) or contains_any(t, CHAIN_WORDS)
     )
 
-def last_is_end_user_public(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> bool:
-    if not comments: return False
-    last = comments[-1]
-    return last.get("public") and last.get("author_id") == ticket.get("requester_id")
+def has_compliment(text: str) -> bool:
+    return contains_any(text, POSITIVE_WORDS)
 
-def user_wrote_after_last_internal(comments: List[Dict[str,Any]], requester_id: int) -> bool:
-    """True se l'ultimo messaggio del cliente (pubblico) è successivo all'ultima nota interna."""
-    last_user_idx = -1
-    last_internal_idx = -1
-    for i, c in enumerate(comments):
-        if c.get("public") and c.get("author_id") == requester_id:
-            last_user_idx = i
-        if not c.get("public"):
-            last_internal_idx = i
-    return last_user_idx > last_internal_idx
+# ============ ORIGINE (Shopify / Amazon-QR / generic) ============
+def safe_lower(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
 
-# ============ OPENAI ============
+def get_ticket_via(ticket: Dict[str, Any]) -> Dict[str, Any]:
+    return ticket.get("via") or {}
+
+def classify_origin(ticket: Dict[str, Any], comments: List[Dict[str, Any]]) -> str:
+    """
+    Ritorna: 'shopify' | 'amazon_qr' | 'generic_email'
+    Regole:
+      - Shopify: via.source.rel == 'shopify' OPPURE corpo contiene la frase tipica del form.
+      - Amazon QR (certo): subject contiene uno dei AMAZON_SUBJECT_TOKENS
+                           OPPURE compare un ordine Amazon nel testo.
+      - Se si cita Amazon genericamente senza questi indizi -> generic_email (chiedere info e decidere dopo).
+    """
+    via = get_ticket_via(ticket)
+    rel = safe_lower(((via.get("source") or {}).get("rel")))
+    if rel == "shopify":
+        return "shopify"
+
+    subject = safe_lower(ticket.get("subject"))
+    thread_text = " ".join([(c.get("body") or "") for c in comments]).lower()
+
+    if SHOPIFY_CONTACT_PHRASE in thread_text:
+        return "shopify"
+
+    if any(tok in subject for tok in AMAZON_SUBJECT_TOKENS):
+        return "amazon_qr"
+    if ORDER_PAT.search(thread_text.replace("\n", " ")):
+        return "amazon_qr"
+
+    return "generic_email"
+
+def tag_origin(ticket_id: int, origin: str):
+    if origin == "shopify":
+        ensure_tags(ticket_id, ["source_shopify_form"])
+    elif origin == "amazon_qr":
+        ensure_tags(ticket_id, ["source_amazon_qr"])
+    else:
+        ensure_tags(ticket_id, ["source_generic_email"])
+
+# ============ OPENAI (placeholder per futuri usi) ============
 client = OpenAI(api_key=OPENAI_APIKEY)
 
-SYSTEM_RULES = f"""
-You are {SIGNATURE_NAME}, the customer service agent for {BRAND_NAME}.
-Tone: warm, polite, professional, crystal-clear. Always sign as '{SIGNATURE_NAME}'.
-Write in the customer’s language if obvious; otherwise use English.
+# ============ BUILDERS DI MESSAGGIO ============
+def greeting(first_name: str) -> str:
+    name = first_name or "there"
+    return f"Hi {name},"
 
-Rules:
-- Always start with "Hi <first_name>," (use provided name or 'there').
-- Ask for the Amazon order number ONLY if it is NOT present in the thread.
-- If photos are already attached, do NOT ask again; thank them for the picture.
-- Size issues are unusual: show empathy and say it's unusual; request only what’s needed (bag model/link; photo only if not provided).
-- Material: if felt too stiff → offer nylon/silk. If nylon/silk too soft → offer felt. Never propose the same material again.
-- Color:
-  * If customer clearly prefers another color, do NOT ask for photos. Confirm replacement and mention tracking. Echo color/bag if known.
-  * If it’s a shade/match question, ask for a picture of the organizer inside the bag to pick a better shade.
-- If request is explicit (specific color/size), be brief and direct (no long preamble). Include reassurance about no return and mention tracking.
-- Otherwise, ask ONLY minimal missing info:
-  - "Could you please confirm the exact model name of your bag, or share a direct link to the one you own?"
-  - If missing: "May I kindly ask you to provide your Amazon order number so I can quickly locate your purchase?"
-- Include this reassurance when appropriate: "{NO_RETURN_SENTENCE}"
-- Never overpromise; say you'll share the tracking as soon as available.
-- Sign as '{SIGNATURE_NAME}'.
-"""
+def build_chain_reply(case: Dict[str, Any], first_name: str) -> str:
+    g = greeting(first_name)
+    if case.get("type") == "length":
+        which = "longer" if case.get("which") == "longer" else "shorter"
+        return (
+            f"{g}\n\nThanks for letting us know — we’ll send a {which} chain right away so you can get the perfect length. "
+            f"{NO_RETURN_SENTENCE}\nWe’ll share the tracking as soon as it’s available.\n\nBest regards,\n{SIGNATURE_NAME}"
+        )
+    if case.get("type") == "color":
+        color = "gold" if case.get("color") == "gold" else "silver"
+        return (
+            f"{g}\n\nThanks for flagging the color — we’ll send a {color} chain as a replacement right away. "
+            f"{NO_RETURN_SENTENCE}\nWe’ll share the tracking as soon as it’s available.\n\nBest regards,\n{SIGNATURE_NAME}"
+        )
+    return (
+        f"{g}\n\nThanks for the details about the chain — we’ll arrange a replacement accordingly. "
+        f"{NO_RETURN_SENTENCE}\nWe’ll share the tracking as soon as it’s available.\n\nBest regards,\n{SIGNATURE_NAME}"
+    )
 
 def summarize_keywords(text: str) -> str:
     t = (text or "").lower()
@@ -216,94 +273,83 @@ def summarize_keywords(text: str) -> str:
     seen, out = set(), []
     for k in picks:
         if k not in seen:
-            out.append(k)
-            seen.add(k)
+            out.append(k); seen.add(k)
         if len(out) >= 3: break
     return ", ".join(out)
 
-def build_chain_reply(case: Dict[str, Any], first_name: str) -> str:
-    g = f"Hi {first_name},"
-    if case.get("type") == "length":
-        which = "longer" if case.get("which") == "longer" else "shorter"
-        return (
-            f"{g}\n\nThanks for letting us know! We’ll send a {which} chain right away so you can get the perfect length. "
-            f"{NO_RETURN_SENTENCE}\nWe’ll share the tracking as soon as it’s available.\n\nBest regards,\n{SIGNATURE_NAME}"
-        )
-    if case.get("type") == "color":
-        color = "gold" if case.get("color") == "gold" else "silver"
-        return (
-            f"{g}\n\nThanks for flagging the color. We’ll send a {color} chain as a replacement right away. "
-            f"{NO_RETURN_SENTENCE}\nWe’ll share the tracking as soon as it’s available.\n\nBest regards,\n{SIGNATURE_NAME}"
-        )
+def build_accept_replacement(first_name: str, echo: str = "") -> str:
+    g = greeting(first_name)
+    tail = f" ({echo})" if echo else ""
     return (
-        f"{g}\n\nThanks for the details about the chain. We’ll arrange a replacement accordingly. "
+        f"{g}\n\nThanks for the details — we’ll arrange a replacement right away{tail}. "
         f"{NO_RETURN_SENTENCE}\nWe’ll share the tracking as soon as it’s available.\n\nBest regards,\n{SIGNATURE_NAME}"
     )
 
-def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
-    last = comments[-1]
-    text = (last.get("body") or "").strip()
-    requester_id = ticket.get("requester_id")
-    first_name = get_user_first_name(requester_id)
-
-    # catena/chain: replacement diretto
-    chain_case = detect_chain_case(text)
-    if chain_case:
-        return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_chain_reply(chain_case, first_name)
-
-    # info già sufficienti? (link oppure misure + foto in thread)
-    thread_text = " ".join([c.get("body","") or "" for c in comments] + [ticket.get("subject","") or ""])
-    info_sufficient = has_link(thread_text) or (thread_has_any_photo(comments) and has_measurements(thread_text))
-
-    order_present = bool(extract_order_number(thread_text))
-    photo_present = message_has_photo(last)
-    explicit = is_explicit_request(text)
-
-    if info_sufficient or explicit:
-        kw = summarize_keywords(text) if explicit else ""
-        g = f"Hi {first_name},"
-        tail = f" ({kw})" if kw else ""
-        msg = (
-            f"{g}\n\nThanks for the details — we’ll arrange a replacement right away{tail}. "
-            f"{NO_RETURN_SENTENCE}\nWe’ll share the tracking as soon as it’s available.\n\nBest regards,\n{SIGNATURE_NAME}"
-        )
-        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
-
-    # altrimenti, chiedi solo il minimo
-    ask_bits = []
+def build_need_info_amazon(first_name: str, need_model_link: bool, order_present: bool, photo_present: bool) -> str:
+    g = greeting(first_name)
+    asks = []
     if not order_present:
-        ask_bits.append("your Amazon order number")
-    # sempre utile avere conferma modello/link per fit perfetto se non sufficiente
-    ask_bits.append("the exact model name of your bag or a direct link to the one you own")
-    ask_line = " and ".join(ask_bits)
-
-    g = f"Hi {first_name},"
-    ask_msg = (
-        f"{g}\n\nThanks for your message! To make sure the fit is perfect, could you please share {ask_line}? "
-        f"{'Thanks for the picture — that’s very helpful. ' if photo_present else ''}"
-        f"{NO_RETURN_SENTENCE}\n\nBest regards,\n{SIGNATURE_NAME}"
-    )
-    return "[Suggested reply by ChatGPT — please review and send]\n\n" + ask_msg
-
-# ============ ANTI-SPAM TRACKING ============
-def normalize_tag(s: str) -> str:
-    return re.sub(r'[^a-z0-9_]', '', (s or '').lower())
-
-def tracking_guard_tag(tracking: str) -> str:
-    return f"tracking_sent_{normalize_tag(tracking)}"
-
-def last_public_comment_contains_tracking(comments: List[Dict[str,Any]], tracking: str) -> bool:
-    if not comments: return False
-    key = normalize_tag(tracking)
-    for c in reversed(comments):
-        if c.get("public"):
-            body = (c.get("body") or "")
-            return key in normalize_tag(body)
-    return False
-
-def build_public_tracking_message(tracking: str) -> str:
+        asks.append("your Amazon order number")
+    if need_model_link:
+        asks.append("the exact model name of your bag or a direct link to the one you own")
+    ask_line = " and ".join(asks)
+    thanks_photo = "Thanks for the photo — that’s very helpful. " if photo_present else ""
     return (
-        "Hi again!\n\n"
+        f"{g}\n\nThanks for your message! To make sure the fit is perfect, could you please share {ask_line}? "
+        f"{thanks_photo}{NO_RETURN_SENTENCE}\n\nBest regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_need_info_shopify(first_name: str, need_model_link: bool, order_present: bool, photo_present: bool) -> str:
+    g = greeting(first_name)
+    asks = []
+    if not order_present:
+        asks.append("your Shopify order number (e.g. #1234) — if not handy, your full name, checkout email, and shipping postcode work perfectly")
+    if need_model_link:
+        asks.append("the exact model name of your bag or a direct link to the one you own")
+    ask_line = " and ".join(asks)
+    thanks_photo = "Thanks for the photo — that’s very helpful. " if photo_present else ""
+    return (
+        f"{g}\n\nThanks for your message! To make sure the fit is perfect, could you please share {ask_line}? "
+        f"{thanks_photo}{NO_RETURN_SENTENCE}\n\nBest regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_shopify_materials(first_name: str, bag_model: Optional[str], with_thanks: bool) -> str:
+    g = greeting(first_name)
+    open_line = "Thank you so much for your kind words — it truly means a lot! " if with_thanks else "Thanks for your message! "
+    model_part = f"For your {bag_model}, " if bag_model else "For your bag, "
+    return (
+        f"{g}\n\n{open_line}{model_part}we can craft the organizer in different materials: "
+        "silk (softer and thinner), nylon (lightweight and waterproof), or felt if you’d still like some structure. "
+        "Let me know which option you prefer and I’ll arrange it for you.\n\nBest regards,\n{sig}".format(sig=SIGNATURE_NAME)
+    )
+
+def build_shopify_custom_size(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\nAbsolutely — custom sizing is no problem, and it’s the same price and timing as standard (production 48h). "
+        "To get the fit just right, could you please share the inside dimensions of your bag (Length × Height × Width)? "
+        "If it’s easier, a quick photo of the inside also helps.\n\n"
+        f"Once I have this, I’ll confirm the cut for you.\n\nBest regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_shade_photo_request(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\nHappy to help with the shade. Could you please send a quick photo of the organizer inside the bag, in good light? "
+        "That way I can recommend the best matching shade right away.\n\nThanks!\nNoe"
+    )
+
+def build_confirmation_after_info(first_name: str, keywords: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\nThanks for the info! We’ll send your replacement according to your instructions: {keywords}. "
+        "We’ll share the tracking shortly.\n\nBest regards,\n{sig}".format(sig=SIGNATURE_NAME)
+    )
+
+def build_public_tracking_message(tracking: str, first_name: Optional[str] = None) -> str:
+    hello = f"Hi {first_name}!" if first_name else "Hi again!"
+    return (
+        f"{hello}\n\n"
         f"Here is the tracking number for your replacement: {tracking}\n"
         "You can follow the updates of your package by clicking on the link below:\n"
         f"https://t.17track.net/en#nums={tracking}\n\n"
@@ -312,44 +358,249 @@ def build_public_tracking_message(tracking: str) -> str:
         f"Warm regards,\n{SIGNATURE_NAME}"
     )
 
+def build_public_tracking_correction_message(tracking: str, first_name: Optional[str]) -> str:
+    hello = f"Hi {first_name}!" if first_name else "Hi there!"
+    return (
+        f"{hello} Please disregard our previous message.\n\n"
+        "Here is the correct tracking number for your replacement:\n"
+        f"{tracking}\n\n"
+        "You can follow the updates of your package by clicking on the link below:\n"
+        f"https://t.17track.net/en#nums={tracking}\n\n"
+        "Feel free to reach out if you have any questions or concerns along the way. "
+        "Wishing you a smooth delivery experience!\n\n"
+        f"Warm regards,\n{SIGNATURE_NAME}"
+    )
+
+# ============ SUPPORTO FLUSSO ============
+def last_is_end_user_public(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> bool:
+    if not comments: return False
+    last = comments[-1]
+    return last.get("public") and last.get("author_id") == ticket.get("requester_id")
+
+def user_wrote_after_last_internal(comments: List[Dict[str,Any]], requester_id: int) -> bool:
+    last_user_idx = -1
+    last_internal_idx = -1
+    for i, c in enumerate(comments):
+        if c.get("public") and c.get("author_id") == requester_id:
+            last_user_idx = i
+        if not c.get("public"):
+            last_internal_idx = i
+    return last_user_idx > last_internal_idx
+
+def extract_first_name_from_shopify_body(comments: List[Dict[str,Any]]) -> Optional[str]:
+    """
+    Cerca riga 'Name:' nel corpo del form Shopify e restituisce il primo nome.
+    """
+    for c in comments:
+        body = (c.get("body") or "")
+        if SHOPIFY_CONTACT_PHRASE in body.lower():
+            # tipico blocco:
+            # Name: Maria D Strange
+            for line in body.splitlines():
+                if line.lower().startswith("name:"):
+                    name = line.split(":",1)[1].strip()
+                    if name:
+                        return name.split()[0]
+    return None
+
+def current_sent_tracking_tag(tags: List[str]) -> Optional[str]:
+    """
+    Ritorna il tag tracking_sent_<...> se presente (il primo trovato).
+    """
+    for t in tags or []:
+        if t.startswith(TRACKING_SENT_PREFIX):
+            return t
+    return None
+
+def extract_tracking_from_guard(tag: str) -> str:
+    # guard è tracking_sent_<normalized>
+    return tag[len(TRACKING_SENT_PREFIX):] if tag and tag.startswith(TRACKING_SENT_PREFIX) else ""
+
+def normalize_tag(s: str) -> str:
+    return re.sub(r'[^a-z0-9_]', '', (s or '').lower())
+
+def last_public_comment_contains_tracking(comments: List[Dict[str,Any]], tracking: str) -> bool:
+    if not comments: return False
+    key = normalize_tag(tracking)
+    for c in reversed(comments):
+        if c.get("public"):
+            body = (c.get("body") or "")
+            if key in normalize_tag(body):
+                return True
+            # anche URL 17track con lo stesso numero
+            if f"nums={normalize_tag(tracking)}" in normalize_tag(body):
+                return True
+            return False
+    return False
+
+# ============ COMPOSIZIONE BOZZE ============
+def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
+    last = comments[-1]
+    text = (last.get("body") or "").strip()
+    requester_id = ticket.get("requester_id")
+
+    # Origine (per tono e richieste)
+    origin = classify_origin(ticket, comments)
+
+    # Nome: preferisci "Name:" del form Shopify, altrimenti requester
+    shopify_first_name = extract_first_name_from_shopify_body(comments) if origin == "shopify" else None
+    first_name = shopify_first_name or get_user_first_name(requester_id)
+
+    # Casi speciali catena/strap
+    chain_case = detect_chain_case(text)
+    if chain_case:
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_chain_reply(chain_case, first_name)
+
+    # Valuta informazioni presenti
+    thread_text = " ".join([c.get("body","") or "" for c in comments] + [ticket.get("subject","") or ""])
+    info_sufficient = has_link(thread_text) or (thread_has_any_photo(comments) and has_measurements(thread_text))
+
+    # Ordini
+    amazon_order_present = bool(extract_order_number(thread_text))
+    photo_present = message_has_photo(last)
+    explicit = is_explicit_request(text)
+    compliment = has_compliment(thread_text)
+
+    # Shopify pre-vendita (materiale/custom) — naturale, niente "headers" robotici
+    if origin == "shopify" and not amazon_order_present:
+        # Intent pre-vendita: materiali o custom
+        if contains_any(text, PRE_SALE_MATERIAL_TRIGGERS) and not explicit:
+            # Materiali: silk / nylon / felt (solo se "vuoi struttura")
+            # bag model: prova a pescare dal subject parole tipo 'LV', 'Lockit', ecc. (fallback None)
+            bag_model = None
+            subj = (ticket.get("subject") or "").strip()
+            if subj:
+                bag_model = subj
+            msg = build_shopify_materials(first_name, bag_model, with_thanks=compliment)
+            return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+
+        if contains_any(text, PRE_SALE_CUSTOM_TRIGGERS) and not explicit:
+            # Custom size sempre possibile, stesso prezzo e 48h
+            msg = build_shopify_custom_size(first_name)
+            return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+
+    # Shade / match: chiedi foto inside solo se serve
+    if "shade" in text.lower() or "match" in text.lower():
+        if not thread_has_any_photo(comments):
+            return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_shade_photo_request(first_name)
+
+    # Replacement esplicito (qualsiasi origine): diretto, breve
+    if explicit:
+        kw = summarize_keywords(text)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_accept_replacement(first_name, kw)
+
+    # Informazioni minime mancanti
+    if origin == "shopify":
+        # post-vendita shopify (o generico): chiedi Shopify order (o nome+email+CAP)
+        msg = build_need_info_shopify(first_name, need_model_link=True, order_present=False, photo_present=photo_present)
+    elif origin == "amazon_qr":
+        msg = build_need_info_amazon(first_name, need_model_link=True, order_present=amazon_order_present, photo_present=photo_present)
+    else:
+        # generic: se nel testo si dice "bought on amazon" senza order -> chiedi order Amazon;
+        # altrimenti chiedi modello/link; resta prudente e minimo indispensabile
+        if "amazon" in thread_text.lower():
+            msg = build_need_info_amazon(first_name, need_model_link=True, order_present=amazon_order_present, photo_present=photo_present)
+        else:
+            # non sappiamo canale → chiedi modello/link; order lo chiederemo solo se necessario dopo
+            msg = (
+                f"{greeting(first_name)}\n\nThanks for your message! "
+                "To make sure the fit is perfect, could you please share the exact model name of your bag or a direct link to the one you own? "
+                f"{'Thanks for the photo — that’s very helpful. ' if photo_present else ''}"
+                "If you’ve already placed an order, feel free to include your order number as well.\n\n"
+                f"Best regards,\n{SIGNATURE_NAME}"
+            )
+
+    return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+
+# ============ TRACKING: INVIO, CORREZIONE, ANTI-SPAM ============
 def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
     """
-    Se c'è tracking:
-      - Se l'ultimo pubblico contiene già il tracking → retro-tag (replacement_sent + guard) e STOP.
-      - Se c'è già il guard tag → STOP (non spammare).
-      - Altrimenti invia messaggio pubblico + status Solved + forza (replacement_sent + guard) nei tag.
-    Ritorna True se ha fatto qualcosa (pubblicato o retro-taggato).
+    Gestione tracking idempotente + correzione:
+      - Se il campo tracking è vuoto → STOP.
+      - Se esiste un tag tracking_sent_<X>:
+          * se <X> == normalize(current) → già inviato → STOP.
+          * se <X> != normalize(current) → INVIA messaggio di CORREZIONE (disregard previous),
+            rimuove tracking_sent_<X>, aggiunge tracking_sent_<current>, forza TAG replacement_sent, set SOLVED.
+      - Se NON esiste alcun tracking_sent_:
+          * Se l’ultimo pubblico contiene già il tracking corrente → retro-tag (replacement_sent + guard corrente) e STOP.
+          * Altrimenti INVIA messaggio tracking standard, aggiunge (replacement_sent + guard), set SOLVED.
+    Ritorna True se ha pubblicato o retro-taggato; False se non ha fatto nulla.
     """
     ticket_id = ticket["id"]
+    requester_id = ticket.get("requester_id")
+    first_name = get_user_first_name(requester_id)
     tags = ticket.get("tags") or []
-    tracking = get_custom_field_value(ticket, Z_TRACKING_FIELD) if Z_TRACKING_FIELD else None
-    if not tracking:
+    current_tracking = get_custom_field_value(ticket, Z_TRACKING_FIELD) if Z_TRACKING_FIELD else None
+    if not current_tracking:
         return False
 
-    guard = tracking_guard_tag(tracking)
-    wanted_tags = [TAG_REPLACEMENT_SENT, guard]
+    current_guard = TRACKING_SENT_PREFIX + normalize_tag(current_tracking)
+    existing_guard = current_sent_tracking_tag(tags)  # es. tracking_sent_uk4246...
 
-    # Se già presente il messaggio (inviato manualmente o prima): retro-tag e fine
     comments = get_ticket_comments(ticket_id)
-    if last_public_comment_contains_tracking(comments, tracking):
-        ensure_tags(ticket_id, wanted_tags)  # forza su 'tags'
+
+    # Caso: esiste già un guard ma è DIVERSO -> correzione tracking
+    if existing_guard and existing_guard != current_guard:
+        # Se abbiamo già inviato questa correzione (cioè il nuovo guard è presente), non ripetere
+        if current_guard in tags or last_public_comment_contains_tracking(comments, current_tracking):
+            # Già comunicato; garantiamo tag (aggiungi nuovo + replacement, togli vecchio)
+            ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
+            remove_tags(ticket_id, [existing_guard])
+            print(f"[OK] Tracking correction retro-tagged on ticket {ticket_id}")
+            # Manteniamo Solved se non lo è già
+            try:
+                z_put(f"/tickets/{ticket_id}.json", {"ticket": {"status": "solved"}})
+            except Exception:
+                pass
+            return True
+
+        # Invia messaggio di correzione
+        body = build_public_tracking_correction_message(current_tracking, first_name)
+        add_public_reply_and_tags(ticket_id, body, [TAG_REPLACEMENT_SENT, current_guard], set_status="solved")
+        # Aggiorna tag: aggiungi nuovo guard + replacement, rimuovi vecchio guard
+        ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
+        remove_tags(ticket_id, [existing_guard])
+        print(f"[OK] Tracking CORRECTED and solved for ticket {ticket_id}")
+        return True
+
+    # Caso: esiste guard uguale → già inviato, non fare nulla
+    if existing_guard == current_guard:
+        return False
+
+    # Caso: nessun guard presente -> prima comunicazione
+    if last_public_comment_contains_tracking(comments, current_tracking):
+        # già comunicato manualmente → retro-tag
+        ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
+        # opzionale: assicura Solved (non chiudiamo closed)
+        try:
+            z_put(f"/tickets/{ticket_id}.json", {"ticket": {"status": "solved"}})
+        except Exception:
+            pass
         print(f"[OK] Retro-tag guard + replacement_sent on ticket {ticket_id}")
         return True
 
-    # Se già taggato per questo tracking → non spammare
-    if guard in tags:
-        return False
-
-    # Invia una sola volta (pubblico) + Solved + forza i tag
-    body = build_public_tracking_message(tracking)
-    add_public_reply_and_tags(ticket_id, body, wanted_tags, set_status="solved")
-    ensure_tags(ticket_id, wanted_tags)
+    # invio standard
+    body = build_public_tracking_message(current_tracking, first_name)
+    add_public_reply_and_tags(ticket_id, body, [TAG_REPLACEMENT_SENT, current_guard], set_status="solved")
+    ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
     print(f"[OK] Tracking published + solved + tags forced for ticket {ticket_id}")
     return True
 
 # ============ CICLO PRINCIPALE ============
 def process_once():
-    # 1) Tracking prima di tutto (idempotente)
+    # 0) Tagga origine (Shopify / Amazon QR / generic) su tutti i ticket non-closed
+    for t in list_recent_tickets():
+        if t.get("status") == "closed":
+            continue
+        try:
+            full = fetch_ticket(t["id"])           # via/subject affidabili
+            comments = get_ticket_comments(t["id"])
+            origin = classify_origin(full, comments)
+            tag_origin(full["id"], origin)
+        except Exception as e:
+            print(f"[WARN] origin tag fail {t.get('id')}: {e}")
+
+    # 1) Tracking prima di tutto (idempotente + correzione)
     for t in list_recent_tickets():
         if t.get("status") == "closed":
             continue
@@ -391,6 +642,7 @@ def process_once():
         except Exception as e:
             print(f"[ERROR draft] {ticket_id}: {e}")
 
+# ============ VALIDAZIONE ENV ============
 def validate_env():
     missing = [k for k,v in {
         "ZENDESK_SUBDOMAIN":Z_SUBDOMAIN,
