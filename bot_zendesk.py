@@ -138,7 +138,15 @@ PRE_SALE_CUSTOM_TRIGGERS   = {"custom"," misura","misure","dimension","size","si
 
 POSITIVE_WORDS = {"love","favourite","favorite","amazing","wonderful","best of all time","i adore","grazie mille","thank you so much","your organizers are my favorite"}
 
+# --- [NUOVO] MATCH A PAROLA INTERA SICURO ---
+def has_word(text: str, word: str) -> bool:
+    return re.search(rf"\b{re.escape(word)}\b", text or "", flags=re.I) is not None
+
+def contains_any_word(text: str, vocab: set) -> bool:
+    return any(has_word(text, w) for w in vocab)
+
 def contains_any(text: str, vocab: set) -> bool:
+    """Match 'largo' (sottostringa). Usato dove va bene. Evitare per taglie/colori."""
     t = (text or "").lower()
     return any(w in t for w in vocab)
 
@@ -167,25 +175,27 @@ def message_has_photo(comment: Dict[str, Any]) -> bool:
     return False
 
 def detect_chain_case(text: str) -> Optional[Dict[str, Any]]:
+    """Usa match a parola intera per evitare falsi positivi."""
     t = (text or "").lower()
-    if not contains_any(t, CHAIN_WORDS):
+    if not contains_any_word(t, CHAIN_WORDS):
         return None
-    if contains_any(t, LONG_WORDS):
+    if contains_any_word(t, LONG_WORDS):
         return {"type":"length","which":"longer"}
-    if contains_any(t, SHORT_WORDS):
+    if contains_any_word(t, SHORT_WORDS):
         return {"type":"length","which":"shorter"}
-    if "gold" in t or "oro" in t:
+    if has_word(t, "gold") or has_word(t, "oro"):
         return {"type":"color","color":"gold"}
-    if "silver" in t or "argento" in t:
+    if has_word(t, "silver") or has_word(t, "argento"):
         return {"type":"color","color":"silver"}
     return {"type":"generic"}
 
 def is_explicit_request(text: str) -> bool:
+    """Esplicita solo se c’è una frase trigger + una parola intera di size/color/chain."""
     if not text: return False
     t = text.lower()
     triggers = ["i want","please send","replace","i would rather have","instead","can you send","please ship","i prefer","i'd like","i would like"]
     return any(k in t for k in triggers) and (
-        contains_any(t, SIZE_WORDS) or contains_any(t, COLOR_WORDS) or contains_any(t, CHAIN_WORDS)
+        contains_any_word(t, SIZE_WORDS) or contains_any_word(t, COLOR_WORDS) or contains_any_word(t, CHAIN_WORDS)
     )
 
 def has_compliment(text: str) -> bool:
@@ -234,7 +244,7 @@ def tag_origin(ticket_id: int, origin: str):
         ensure_tags(ticket_id, ["source_generic_email"])
 
 # ============ OPENAI (placeholder per futuri usi) ============
-client = OpenAI(api_key=OPENAI_APIKEY)
+client = OpenAI(api_key=OPENAIAPIKEY) if (OPENAI_APIKEY := OPENAI_APIKEY) else None  # safe load
 
 # ============ BUILDERS DI MESSAGGIO ============
 def greeting(first_name: str) -> str:
@@ -261,15 +271,23 @@ def build_chain_reply(case: Dict[str, Any], first_name: str) -> str:
     )
 
 def summarize_keywords(text: str) -> str:
+    """Estrai parole CHIAVE con match a parola intera; evitiamo falsi positivi (es. 'tan' da 'thanks')."""
     t = (text or "").lower()
     picks = []
+
+    # size
     for w in SIZE_WORDS:
-        if w in t: picks.append(w)
+        if has_word(t, w): picks.append(w)
+
+    # color (incluso 'tan' ma solo come parola intera)
     for w in ("dark brown","brown","black","white","gold","silver","beige","sienna","red","blue","navy","tan","camel","cream","ivory","pink","green","grey","gray","chocolate"):
-        if w in t: picks.append(w)
-    if contains_any(t, CHAIN_WORDS): picks.append("chain")
-    if contains_any(t, LONG_WORDS): picks.append("longer")
-    if contains_any(t, SHORT_WORDS): picks.append("shorter")
+        if has_word(t, w): picks.append(w)
+
+    # chain specifics
+    if contains_any_word(t, CHAIN_WORDS): picks.append("chain")
+    if contains_any_word(t, LONG_WORDS): picks.append("longer")
+    if contains_any_word(t, SHORT_WORDS): picks.append("shorter")
+
     seen, out = set(), []
     for k in picks:
         if k not in seen:
@@ -465,17 +483,11 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     if origin == "shopify" and not amazon_order_present:
         # Intent pre-vendita: materiali o custom
         if contains_any(text, PRE_SALE_MATERIAL_TRIGGERS) and not explicit:
-            # Materiali: silk / nylon / felt (solo se "vuoi struttura")
-            # bag model: prova a pescare dal subject parole tipo 'LV', 'Lockit', ecc. (fallback None)
-            bag_model = None
-            subj = (ticket.get("subject") or "").strip()
-            if subj:
-                bag_model = subj
+            bag_model = (ticket.get("subject") or "").strip() or None
             msg = build_shopify_materials(first_name, bag_model, with_thanks=compliment)
             return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
         if contains_any(text, PRE_SALE_CUSTOM_TRIGGERS) and not explicit:
-            # Custom size sempre possibile, stesso prezzo e 48h
             msg = build_shopify_custom_size(first_name)
             return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
@@ -484,14 +496,17 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
         if not thread_has_any_photo(comments):
             return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_shade_photo_request(first_name)
 
-    # Replacement esplicito (qualsiasi origine): diretto, breve
+    # Replacement esplicito (qualsiasi origine): diretto, breve — echo parole chiave (max 2)
     if explicit:
-        kw = summarize_keywords(text)
+        kw_raw = summarize_keywords(text)
+        kws = [k.strip() for k in kw_raw.split(",") if k.strip()]
+        if len(kws) > 2:
+            kws = kws[:2]
+        kw = ", ".join(kws)
         return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_accept_replacement(first_name, kw)
 
-    # Informazioni minime mancanti
+    # Informazioni minime mancanti (se non è esplicito NON facciamo eco keyword)
     if origin == "shopify":
-        # post-vendita shopify (o generico): chiedi Shopify order (o nome+email+CAP)
         msg = build_need_info_shopify(first_name, need_model_link=True, order_present=False, photo_present=photo_present)
     elif origin == "amazon_qr":
         msg = build_need_info_amazon(first_name, need_model_link=True, order_present=amazon_order_present, photo_present=photo_present)
@@ -501,7 +516,6 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
         if "amazon" in thread_text.lower():
             msg = build_need_info_amazon(first_name, need_model_link=True, order_present=amazon_order_present, photo_present=photo_present)
         else:
-            # non sappiamo canale → chiedi modello/link; order lo chiederemo solo se necessario dopo
             msg = (
                 f"{greeting(first_name)}\n\nThanks for your message! "
                 "To make sure the fit is perfect, could you please share the exact model name of your bag or a direct link to the one you own? "
@@ -543,11 +557,9 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
     if existing_guard and existing_guard != current_guard:
         # Se abbiamo già inviato questa correzione (cioè il nuovo guard è presente), non ripetere
         if current_guard in tags or last_public_comment_contains_tracking(comments, current_tracking):
-            # Già comunicato; garantiamo tag (aggiungi nuovo + replacement, togli vecchio)
             ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
             remove_tags(ticket_id, [existing_guard])
             print(f"[OK] Tracking correction retro-tagged on ticket {ticket_id}")
-            # Manteniamo Solved se non lo è già
             try:
                 z_put(f"/tickets/{ticket_id}.json", {"ticket": {"status": "solved"}})
             except Exception:
@@ -557,7 +569,6 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
         # Invia messaggio di correzione
         body = build_public_tracking_correction_message(current_tracking, first_name)
         add_public_reply_and_tags(ticket_id, body, [TAG_REPLACEMENT_SENT, current_guard], set_status="solved")
-        # Aggiorna tag: aggiungi nuovo guard + replacement, rimuovi vecchio guard
         ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
         remove_tags(ticket_id, [existing_guard])
         print(f"[OK] Tracking CORRECTED and solved for ticket {ticket_id}")
@@ -569,9 +580,7 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
 
     # Caso: nessun guard presente -> prima comunicazione
     if last_public_comment_contains_tracking(comments, current_tracking):
-        # già comunicato manualmente → retro-tag
         ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-        # opzionale: assicura Solved (non chiudiamo closed)
         try:
             z_put(f"/tickets/{ticket_id}.json", {"ticket": {"status": "solved"}})
         except Exception:
