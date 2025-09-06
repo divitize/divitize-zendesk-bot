@@ -244,7 +244,13 @@ def tag_origin(ticket_id: int, origin: str):
         ensure_tags(ticket_id, ["source_generic_email"])
 
 # ============ OPENAI (placeholder per futuri usi) ============
-client = OpenAI(api_key=OPENAIAPIKEY) if (OPENAI_APIKEY := OPENAI_APIKEY) else None  # safe load
+client = None
+try:
+    if OPENAI_APIKEY:
+        client = OpenAI(api_key=OPENAI_APIKEY)
+except Exception as e:
+    print(f"[WARN] OpenAI init failed: {e}")
+    client = None
 
 # ============ BUILDERS DI MESSAGGIO ============
 def greeting(first_name: str) -> str:
