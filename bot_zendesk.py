@@ -131,12 +131,32 @@ COLOR_WORDS = {"black","white","brown","dark brown","beige","sienna","red","blue
 CHAIN_WORDS = {"chain","strap","shoulder strap","tracolla","catena","belt"}
 SHORT_WORDS = {"short","too short","shorter","più corta","piu corta"}
 LONG_WORDS  = {"long","too long","longer","più lunga","piu lunga"}
-SIZE_WORDS  = {"mini","small","medium","large","xl","vanity","pm","mm","gm","bb","nano","micro"}
+
+# --- SIZE: parole intere (senza 'mm')
+SIZE_WORDS_BASE  = {"mini","small","medium","large","xl","vanity","pm","gm","bb","nano","micro"}
+# --- 'mm' solo come token isolato, case-insensitive
+MM_TOKEN_REGEX = re.compile(r'(?<![A-Za-z])mm(?![A-Za-z])', re.I)
 
 PRE_SALE_MATERIAL_TRIGGERS = {"thinner","thin","sottile","silk","nylon","felt","material","soft","morbido","rigido","stiff"}
 PRE_SALE_CUSTOM_TRIGGERS   = {"custom"," misura","misure","dimension","size","sizing","fit","fits","su misura","tailor","bespoke"}
 
 POSITIVE_WORDS = {"love","favourite","favorite","amazing","wonderful","best of all time","i adore","grazie mille","thank you so much","your organizers are my favorite"}
+
+# Riconoscimento messaggi di puro ringraziamento/chiusura
+ACK_PAT = re.compile(
+    r'\b('
+    r'(thank(s| you)|thanks again|appreciat(ed|e))'
+    r'|fit(s)? (perfectly|great|well)'
+    r'|received .*replacement'
+    r'|happy with (it|the replacement|my organizer)'
+    r'|works great'
+    r')\b',
+    re.I
+)
+
+def is_acknowledgement(text: str) -> bool:
+    """Rileva messaggi di ringraziamento/chiusura (nessuna nuova richiesta)."""
+    return bool(ACK_PAT.search(text or ""))
 
 # --- [NUOVO] MATCH A PAROLA INTERA SICURO ---
 def has_word(text: str, word: str) -> bool:
@@ -189,13 +209,24 @@ def detect_chain_case(text: str) -> Optional[Dict[str, Any]]:
         return {"type":"color","color":"silver"}
     return {"type":"generic"}
 
+def text_has_size_word_strict(t: str) -> bool:
+    """True se troviamo una size valida (parola intera) o 'mm' token isolato (qualsiasi casing)."""
+    return contains_any_word(t, SIZE_WORDS_BASE) or bool(MM_TOKEN_REGEX.search(t or ""))
+
+def extract_size_keywords_strict(t: str) -> list:
+    """Estrae size sicure; 'mm' token isolato viene reso come 'MM' in output."""
+    picks = [w for w in SIZE_WORDS_BASE if has_word(t, w)]
+    if MM_TOKEN_REGEX.search(t or ""):
+        picks.append("MM")
+    return picks
+
 def is_explicit_request(text: str) -> bool:
     """Esplicita solo se c’è una frase trigger + una parola intera di size/color/chain."""
     if not text: return False
     t = text.lower()
     triggers = ["i want","please send","replace","i would rather have","instead","can you send","please ship","i prefer","i'd like","i would like"]
     return any(k in t for k in triggers) and (
-        contains_any_word(t, SIZE_WORDS) or contains_any_word(t, COLOR_WORDS) or contains_any_word(t, CHAIN_WORDS)
+        text_has_size_word_strict(t) or contains_any_word(t, COLOR_WORDS) or contains_any_word(t, CHAIN_WORDS)
     )
 
 def has_compliment(text: str) -> bool:
@@ -281,9 +312,8 @@ def summarize_keywords(text: str) -> str:
     t = (text or "").lower()
     picks = []
 
-    # size
-    for w in SIZE_WORDS:
-        if has_word(t, w): picks.append(w)
+    # size sicure (incl. token MM isolato)
+    picks.extend(extract_size_keywords_strict(t))
 
     # color (incluso 'tan' ma solo come parola intera)
     for w in ("dark brown","brown","black","white","gold","silver","beige","sienna","red","blue","navy","tan","camel","cream","ivory","pink","green","grey","gray","chocolate"):
@@ -395,6 +425,18 @@ def build_public_tracking_correction_message(tracking: str, first_name: Optional
         f"Warm regards,\n{SIGNATURE_NAME}"
     )
 
+def build_ack_review_request(first_name: str) -> str:
+    name = first_name or "there"
+    return (
+        f"Hi again {name}!\n\n"
+        "I’m so happy to hear that your replacement fits perfectly in your bag! "
+        "Thank you for sharing this with me — it truly makes my day.\n\n"
+        "If you ever feel like sharing your experience, we’d be so grateful for a quick review with a photo of your organizer inside your bag. "
+        "It really helps other customers and means a lot to our small business.\n\n"
+        "However thanks again for your kind words and support!\n\n"
+        f"Warm regards,\n{SIGNATURE_NAME}"
+    )
+
 # ============ SUPPORTO FLUSSO ============
 def last_is_end_user_public(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> bool:
     if not comments: return False
@@ -469,6 +511,10 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     # Nome: preferisci "Name:" del form Shopify, altrimenti requester
     shopify_first_name = extract_first_name_from_shopify_body(comments) if origin == "shopify" else None
     first_name = shopify_first_name or get_user_first_name(requester_id)
+
+    # Messaggi di puro ringraziamento/chiusura → proponi richiesta recensione (bozza)
+    if is_acknowledgement(text):
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_ack_review_request(first_name)
 
     # Casi speciali catena/strap
     chain_case = detect_chain_case(text)
