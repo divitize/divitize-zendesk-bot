@@ -1,5 +1,12 @@
+Ecco il file completo al 100% con tutte le funzioni/euristiche e le aggiunte richieste (rilevazione ringraziamento “puro” con eccezioni, messaggio recensione con foto, fix “MM” token, anti-spam tracking + correzione, origine Shopify/Amazon QR, materiali/custom, shade photo, ecc.). Puoi copiare e incollare così com’è.
+
 # bot_zendesk.py — Divitize Zendesk Assistant (full)
-import os, re, time, threading, requests
+
+import os
+import re
+import time
+import threading
+import requests
 from typing import List, Dict, Any, Optional
 from flask import Flask, jsonify
 from openai import OpenAI
@@ -142,21 +149,60 @@ PRE_SALE_CUSTOM_TRIGGERS   = {"custom"," misura","misure","dimension","size","si
 
 POSITIVE_WORDS = {"love","favourite","favorite","amazing","wonderful","best of all time","i adore","grazie mille","thank you so much","your organizers are my favorite"}
 
-# Riconoscimento messaggi di puro ringraziamento/chiusura
-ACK_PAT = re.compile(
-    r'\b('
-    r'(thank(s| you)|thanks again|appreciat(ed|e))'
-    r'|fit(s)? (perfectly|great|well)'
-    r'|received .*replacement'
-    r'|happy with (it|the replacement|my organizer)'
-    r'|works great'
-    r')\b',
+# --- RICONOSCIMENTO RINGRAZIAMENTO PURO (no richiesta) ---
+THANKS_RE = re.compile(
+    r"\b(thank(?: you)?|thanks|appreciate|grateful|many thanks|"
+    r"so happy|happy to hear|it fits(?: perfectly)?|fits perfectly|"
+    r"works great|received (?:the )?replacement)\b",
     re.I
 )
 
-def is_acknowledgement(text: str) -> bool:
-    """Rileva messaggi di ringraziamento/chiusura (nessuna nuova richiesta)."""
-    return bool(ACK_PAT.search(text or ""))
+# eccezioni: "would like/want/wanted/just want to thank" = ringraziamento, non richiesta
+THANKS_EXCEPTION_RE = re.compile(r"\b(would like|want|wanted|just want)\s+to\s+thank\b", re.I)
+
+# indizi di richiesta/azione (escludiamo se compaiono, salvo eccezione sopra)
+REQUEST_CUES_RE = re.compile(
+    r"\b(need|needs|need to|want|would like|i'd like|can you|could you|"
+    r"please (send|ship|exchange|replace)|replace|exchange|return|refund|"
+    r"smaller|larger|different|another|send|ship|arrange|help)\b",
+    re.I
+)
+
+# indizi di problema/lamentela: se presenti, non è ringraziamento “puro”
+NEGATIVE_CUES_RE = re.compile(
+    r"\b(too small|too big|pinched|does(?:n'?| no)t fit|did(?:n'?| not) fit|"
+    r"wrong|incorrect|issue|problem|damaged|broken|faulty)\b",
+    re.I
+)
+
+def is_pure_thanks(text: str) -> bool:
+    """Vero se il messaggio è di ringraziamento/chiusura (no azioni richieste).
+       Gestisce eccezioni 'would like to thank / want to thank' ecc. e vale SOLO in assenza di altro contenuto."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    if not THANKS_RE.search(t):
+        return False
+
+    # se è la forma 'to thank', NON consideriamo i cue di richiesta
+    if THANKS_EXCEPTION_RE.search(t):
+        has_request = False
+    else:
+        has_request = bool(REQUEST_CUES_RE.search(t))
+
+    if has_request:
+        return False
+
+    # niente domande
+    if "?" in t:
+        return False
+
+    # niente indizi di problema/lamentela
+    if NEGATIVE_CUES_RE.search(t):
+        return False
+
+    return True
 
 # --- [NUOVO] MATCH A PAROLA INTERA SICURO ---
 def has_word(text: str, word: str) -> bool:
@@ -460,8 +506,6 @@ def extract_first_name_from_shopify_body(comments: List[Dict[str,Any]]) -> Optio
     for c in comments:
         body = (c.get("body") or "")
         if SHOPIFY_CONTACT_PHRASE in body.lower():
-            # tipico blocco:
-            # Name: Maria D Strange
             for line in body.splitlines():
                 if line.lower().startswith("name:"):
                     name = line.split(":",1)[1].strip()
@@ -493,7 +537,6 @@ def last_public_comment_contains_tracking(comments: List[Dict[str,Any]], trackin
             body = (c.get("body") or "")
             if key in normalize_tag(body):
                 return True
-            # anche URL 17track con lo stesso numero
             if f"nums={normalize_tag(tracking)}" in normalize_tag(body):
                 return True
             return False
@@ -512,9 +555,11 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     shopify_first_name = extract_first_name_from_shopify_body(comments) if origin == "shopify" else None
     first_name = shopify_first_name or get_user_first_name(requester_id)
 
-    # Messaggi di puro ringraziamento/chiusura → proponi richiesta recensione (bozza)
-    if is_acknowledgement(text):
+    # ---------- RINGRAZIAMENTO PURO ⇒ proposta recensione (bozza interna) ----------
+    thread_text = " ".join([c.get("body","") or "" for c in comments] + [ticket.get("subject","") or ""])
+    if is_pure_thanks(text) and not is_explicit_request(text):
         return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_ack_review_request(first_name)
+    # --------------------------------------------------------------------------------
 
     # Casi speciali catena/strap
     chain_case = detect_chain_case(text)
@@ -522,18 +567,17 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
         return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_chain_reply(chain_case, first_name)
 
     # Valuta informazioni presenti
-    thread_text = " ".join([c.get("body","") or "" for c in comments] + [ticket.get("subject","") or ""])
-    info_sufficient = has_link(thread_text) or (thread_has_any_photo(comments) and has_measurements(thread_text))
+    info_text = thread_text
+    info_sufficient = has_link(info_text) or (thread_has_any_photo(comments) and has_measurements(info_text))
 
     # Ordini
-    amazon_order_present = bool(extract_order_number(thread_text))
+    amazon_order_present = bool(extract_order_number(info_text))
     photo_present = message_has_photo(last)
     explicit = is_explicit_request(text)
-    compliment = has_compliment(thread_text)
+    compliment = has_compliment(info_text)
 
     # Shopify pre-vendita (materiale/custom) — naturale, niente "headers" robotici
     if origin == "shopify" and not amazon_order_present:
-        # Intent pre-vendita: materiali o custom
         if contains_any(text, PRE_SALE_MATERIAL_TRIGGERS) and not explicit:
             bag_model = (ticket.get("subject") or "").strip() or None
             msg = build_shopify_materials(first_name, bag_model, with_thanks=compliment)
@@ -563,9 +607,7 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     elif origin == "amazon_qr":
         msg = build_need_info_amazon(first_name, need_model_link=True, order_present=amazon_order_present, photo_present=photo_present)
     else:
-        # generic: se nel testo si dice "bought on amazon" senza order -> chiedi order Amazon;
-        # altrimenti chiedi modello/link; resta prudente e minimo indispensabile
-        if "amazon" in thread_text.lower():
+        if "amazon" in info_text.lower():
             msg = build_need_info_amazon(first_name, need_model_link=True, order_present=amazon_order_present, photo_present=photo_present)
         else:
             msg = (
