@@ -1,5 +1,3 @@
-Ecco il file completo al 100% con tutte le funzioni/euristiche e le aggiunte richieste (rilevazione ringraziamento “puro” con eccezioni, messaggio recensione con foto, fix “MM” token, anti-spam tracking + correzione, origine Shopify/Amazon QR, materiali/custom, shade photo, ecc.). Puoi copiare e incollare così com’è.
-
 # bot_zendesk.py — Divitize Zendesk Assistant (full)
 
 import os
