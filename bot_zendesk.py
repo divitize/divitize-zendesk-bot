@@ -175,15 +175,16 @@ NEGATIVE_CUES_RE = re.compile(
 
 def is_pure_thanks(text: str) -> bool:
     """Vero se il messaggio è di ringraziamento/chiusura (no azioni richieste).
-       Gestisce eccezioni 'would like to thank / want to thank' ecc. e vale SOLO in assenza di altro contenuto."""
+       Gestisce eccezioni 'would like to thank / want to thank' ecc."""
     t = (text or "").strip().lower()
     if not t:
         return False
 
+    # deve esserci un segnale di ringraziamento/fine positiva
     if not THANKS_RE.search(t):
         return False
 
-    # se è la forma 'to thank', NON consideriamo i cue di richiesta
+    # se c'è un trigger di richiesta, vale solo se NON è la forma "to thank"
     if THANKS_EXCEPTION_RE.search(t):
         has_request = False
     else:
@@ -553,11 +554,11 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     shopify_first_name = extract_first_name_from_shopify_body(comments) if origin == "shopify" else None
     first_name = shopify_first_name or get_user_first_name(requester_id)
 
-    # ---------- RINGRAZIAMENTO PURO ⇒ proposta recensione (bozza interna) ----------
+    # ---------- RINGRAZIAMENTO PURO → proposta recensione (bozza interna) ----------
     thread_text = " ".join([c.get("body","") or "" for c in comments] + [ticket.get("subject","") or ""])
-    if is_pure_thanks(text) and not is_explicit_request(text):
+    if is_pure_thanks(text) or is_pure_thanks(thread_text):
         return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_ack_review_request(first_name)
-    # --------------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------------
 
     # Casi speciali catena/strap
     chain_case = detect_chain_case(text)
