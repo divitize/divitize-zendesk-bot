@@ -560,6 +560,46 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
         return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_ack_review_request(first_name)
     # ---------------------------------------------------------------------------------
 
+# ---------- RECENSIONE (GIÀ LASCIATA O FUTURA) ----------
+REVIEW_LEFT_RE = re.compile(
+    r"\b(i\s*(have|had|just|already)?\s*(left|posted|wrote|submitted|gave|made|sent|shared|uploaded)\b.*\b(review|feedback|rating|5\s*stars?)\b)"
+    r"|\b(i\s*(have|had|just|already)?\s*(reviewed|rated)\b)"
+    r"|\b(thank you for letting me leave a review)\b",
+    re.I
+)
+
+REVIEW_FUTURE_RE = re.compile(
+    r"\b(i\s*(will|am going to|plan to|want to|would like to|intend to)\s*(leave|write|post|submit|make|give|send|share|upload)\b.*\b(review|feedback|rating|5\s*stars?)\b)"
+    r"|\b(i’ll\s*(write|post|leave|give)\s*(you\s+a\s+)?(nice|good)?\s*(review|feedback|rating))\b",
+    re.I
+)
+
+REVIEW_CONDITIONAL_RE = re.compile(
+    r"\b(if\s+i\s*(leave|write|give|post|submit|make|send|share|upload)\b.*\b(review|feedback|rating|5\s*stars?))\b",
+    re.I
+)
+
+# Caso: recensione già lasciata
+if REVIEW_LEFT_RE.search(text) and not REVIEW_CONDITIONAL_RE.search(text):
+    msg = (
+        f"Oh wow, what a wonderful news! Thank you so much from the bottom of our hearts for your incredible support.\n\n"
+        f"We feel genuinely lucky and honored to have a customer like you, {first_name}, and we really hope to see you again in the future.\n\n"
+        "Wishing you a lovely rest of the week,\n"
+        "Noe"
+    )
+    return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+
+# Caso: recensione promessa ma non ancora lasciata
+elif REVIEW_FUTURE_RE.search(text) and not REVIEW_CONDITIONAL_RE.search(text):
+    msg = (
+        f"That’s so kind of you, {first_name}! We honestly can’t wait to read your review once it’s published.\n\n"
+        "It truly means a lot to us to know you’re planning to share your experience — thank you for being so thoughtful.\n\n"
+        "Wishing you a wonderful day ahead,\n"
+        "Noe"
+    )
+    return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+# --------------------------------------------------------------
+
     # Casi speciali catena/strap
     chain_case = detect_chain_case(text)
     if chain_case:
