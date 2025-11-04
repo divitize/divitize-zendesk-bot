@@ -482,6 +482,43 @@ def build_ack_review_request(first_name: str) -> str:
         f"Warm regards,\n{SIGNATURE_NAME}"
     )
 
+# ============ RETURN POLICY AUTO REPLY ============
+RETURN_REQUEST_RE = re.compile(
+    r"\b("
+    r"do i need to (return|send back|ship back|mail back|send this|send it back)|"
+    r"should i (return|send back|ship back|mail this|ship this)|"
+    r"must i return|"
+    r"do you need (me to return|me to send it back)|"
+    r"need to (return|send back)|"
+    r"will you (send a label|need the old one back)|"
+    r"do you want (me to send|me to return)|"
+    r"want me to return|"
+    r"do you want it back|"
+    r"send (it|this) back to you|"
+    r"send the old one|"
+    r"return the old one"
+    r")\b",
+    re.I
+)
+
+def build_return_only(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\n"
+        "No need to send it back — we’ll take care of everything on our end. "
+        "You can keep it and use it to protect your bag while waiting for the new one, "
+        "or dispose of it if you don’t need it anymore.\n\n"
+        "Wishing you a wonderful day,\n"
+        f"{SIGNATURE_NAME}"
+    )
+
+def build_return_appendix() -> str:
+    return (
+        "No need to send the old one back — we’ll take care of everything on our end. "
+        "You can keep it and use it to protect your bag while waiting for the new one, "
+        "or dispose of it if you don’t need it anymore."
+    )
+
 # ============ SUPPORTO FLUSSO ============
 def last_is_end_user_public(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> bool:
     if not comments: return False
@@ -639,7 +676,21 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
         if len(kws) > 2:
             kws = kws[:2]
         kw = ", ".join(kws)
-        return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_accept_replacement(first_name, kw)
+
+        base_msg = build_accept_replacement(first_name, kw)
+
+        # Se nel messaggio c’è domanda di reso, aggiungi la parte Return alla fine del messaggio principale
+        if RETURN_REQUEST_RE.search(text):
+            base_msg = base_msg.replace(
+                "We’ll share the tracking as soon as it’s available.",
+                build_return_appendix() + "\nWe’ll share the tracking as soon as it’s available."
+            )
+
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + base_msg
+    
+        # Caso: solo domanda sul reso (no replacement esplicito)
+    if RETURN_REQUEST_RE.search(text) and not explicit:
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_return_only(first_name)
 
     # Informazioni minime mancanti (se non è esplicito NON facciamo eco keyword)
     if origin == "shopify":
