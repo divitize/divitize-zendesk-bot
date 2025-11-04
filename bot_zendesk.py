@@ -150,7 +150,11 @@ POSITIVE_WORDS = {"love","favourite","favorite","amazing","wonderful","best of a
 # --- RICONOSCIMENTO RINGRAZIAMENTO PURO (no richiesta) ---
 THANKS_RE = re.compile(
     r"\b(thank(?: you)?|thanks|appreciate|grateful|many thanks|"
-    r"so happy|happy to hear|it fits(?: perfectly)?|fits perfectly|"
+    r"so happy|i(?:'m| am)?\s+so\s+happy|"
+    r"so glad|i(?:'m| am)?\s+so\s+glad|"
+    r"i(?:'m| am)?\s+glad|"
+    r"it'?s\s+perfect|perfect|"
+    r"happy to hear|it fits(?: perfectly)?|fits perfectly|"
     r"works great|received (?:the )?replacement)\b",
     re.I
 )
