@@ -669,7 +669,7 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
             return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
     # Shade / match: chiedi foto inside solo se serve
-    SHADE_TRIGGERS = {"shade", "match", "darker", "lighter", "not quite the right color", "color is off", "wrong shade", "tone", "too dark", "too light"}
+    SHADE_TRIGGERS = {"shade", "match", "color", "wrong color", "darker", "lighter", "not quite the right color", "color is off", "wrong shade", "tone", "too dark", "too light"}
 
     if any(word in text.lower() for word in SHADE_TRIGGERS):
         if not thread_has_any_photo(comments):
