@@ -129,6 +129,48 @@ MEASURES_PAT = re.compile(
     r'\b(\d{1,2}(\.\d{1,2})?)\s*[x×]\s*(\d{1,2}(\.\d{1,2})?)\s*[x×]\s*(\d{1,2}(\.\d{1,2})?)\b',
     re.I
 )
+
+# --- Misure 2D con unità: es. "41.5 cm L and 18 cm D" / "16 in L and 7 in D"
+MEASURES_2D_PAT = re.compile(
+    r"(?P<a>\d{1,3}(?:\.\d{1,2})?)\s*(?P<unit>cm|inches|inch|in|\")\s*(?:l|len|length)\b"
+    r"(?:\s*(?:and|&|x|×|by)\s*)"
+    r"(?P<b>\d{1,3}(?:\.\d{1,2})?)\s*(?P=unit)\s*(?:d|dep|depth|w|wid|width)\b",
+    re.I
+)
+
+def normalize_unit(u: str) -> str:
+    u = (u or "").strip().lower()
+    if u in ('"', 'in', 'inch', 'inches'):
+        return "in"
+    if u == "cm":
+        return "cm"
+    return u or ""
+
+def extract_measurement_sets(text: str) -> list:
+    """
+    Estrae set di misure trovati nel testo (2D con unità, 3D con x×x).
+    """
+    t = text or ""
+    out = []
+
+    # 2D
+    for m in MEASURES_2D_PAT.finditer(t):
+        out.append({
+            "kind": "2d",
+            "values": (m.group("a"), m.group("b")),
+            "unit": normalize_unit(m.group("unit"))
+        })
+
+    # 3D (riusa MEASURES_PAT già esistente)
+    for m in MEASURES_PAT.finditer(t):
+        out.append({
+            "kind": "3d",
+            "values": (m.group(1), m.group(3), m.group(5)),
+            "unit": ""
+        })
+
+    return out
+
 SHOPIFY_CONTACT_PHRASE = "you received a new message from your online store's contact form"
 
 COLOR_WORDS = {"black","white","brown","dark brown","beige","sienna","red","blue","navy","tan","camel",
@@ -136,6 +178,84 @@ COLOR_WORDS = {"black","white","brown","dark brown","beige","sienna","red","blue
 CHAIN_WORDS = {"chain","strap","shoulder strap","tracolla","catena","belt"}
 SHORT_WORDS = {"short","too short","shorter","più corta","piu corta"}
 LONG_WORDS  = {"long","too long","longer","più lunga","piu lunga"}
+
+# --- Height adjustment (taller / shorter) ---
+HEIGHT_TALLER_TRIGGERS = {
+    "taller", "more height", "higher",
+    "too short", "pretty short", "not tall enough",
+    "short in height", "height is short"
+}
+
+HEIGHT_SHORTER_TRIGGERS = {
+    "shorter", "less height", "lower",
+    "too tall", "pretty tall", "not short enough",
+    "tall in height", "height is tall",
+    "too high", "sits too high"
+}
+
+def detect_height_adjustment(text: str) -> Optional[str]:
+    """
+    Returns:
+      - "taller"    if the customer wants more height
+      - "shorter"   if the customer wants less height
+      - "ambiguous" if both signals are present
+      - None        if not a height-adjustment case
+    """
+    if not text:
+        return None
+    t = text.lower()
+
+    # If it's an explicit replacement request, handle elsewhere
+    if is_explicit_request(text):
+        return None
+
+    # Use word-boundary matching for single tokens + substring for multi-word phrases
+    wants_taller = any(has_word(t, w) or (w in t) for w in HEIGHT_TALLER_TRIGGERS)
+    wants_shorter = any(has_word(t, w) or (w in t) for w in HEIGHT_SHORTER_TRIGGERS)
+
+    if wants_taller and not wants_shorter:
+        return "taller"
+    if wants_shorter and not wants_taller:
+        return "shorter"
+    if wants_taller and wants_shorter:
+        return "ambiguous"
+
+    return None
+
+PREFER_IN_RE = re.compile(
+    r"\b(i\s+would\s+prefer|would\s+prefer|i\s+prefer|prefer)\b.*\b(in|to)\b",
+    re.I
+)
+
+COLOR_CONTEXT_RE = re.compile(r"\b(color|colour|shade|option|tone)\b", re.I)
+SIZE_CONTEXT_RE  = re.compile(r"\b(size|sizing)\b", re.I)
+
+def extract_color_word(text: str) -> str:
+    t = (text or "").lower()
+    # cerca colori "più lunghi" prima (es. dark brown)
+    for w in sorted(COLOR_WORDS, key=lambda x: -len(x)):
+        if has_word(t, w):
+            return w
+    return ""
+
+def is_color_change_intent(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+
+    # serve intenzione "prefer ... in/to ..."
+    if not PREFER_IN_RE.search(text):
+        return False
+
+    # se parla di size o contiene size keyword, non è cambio colore
+    if SIZE_CONTEXT_RE.search(text) or text_has_size_word_strict(t):
+        return False
+
+    # deve esserci contesto colore o un colore noto
+    if COLOR_CONTEXT_RE.search(text) or contains_any_word(t, COLOR_WORDS):
+        return True
+
+    return False
 
 # --- SIZE: parole intere (senza 'mm')
 SIZE_WORDS_BASE  = {"mini","small","medium","large","xl","vanity","pm","gm","bb","nano","micro"}
@@ -333,6 +453,68 @@ except Exception as e:
     client = None
 
 # ============ BUILDERS DI MESSAGGIO ============
+def build_height_taller_reply(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\n"
+        "Thank you for your message! Yes, we can absolutely make the same organizer taller.\n\n"
+        "To make sure the fit is perfect, could you please show me how the current organizer fits inside your bag? "
+        "A quick photo would be ideal. This will help me understand how much extra height to add without increasing it too much.\n\n"
+        "Alternatively, you can also let me know your ideal insert height, or simply tell me how many inches or centimeters taller you’d like it to be.\n\n"
+        "Thank you so much for your help.\n\n"
+        f"Warm regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_height_shorter_reply(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\n"
+        "Thank you for your message! Yes, we can absolutely make the same organizer shorter.\n\n"
+        "To make sure the fit is perfect, could you please show me how the current organizer fits inside your bag? "
+        "A quick photo would be ideal. This will help me understand how much height to reduce without making it too short.\n\n"
+        "Alternatively, you can also let me know your ideal insert height, or simply tell me how many inches or centimeters shorter you’d like it to be.\n\n"
+        "Thank you so much for your help.\n\n"
+        f"Warm regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_height_ambiguous_reply(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\n"
+        "Thank you for your message! I’d be happy to adjust the organizer height for you.\n\n"
+        "Could you please show me how the current organizer fits inside your bag (a quick photo is perfect), "
+        "and let me know whether you’d like it taller or shorter — and by how many inches or centimeters?\n\n"
+        "Thank you so much for your help.\n\n"
+        f"Warm regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_listing_mismatch_reply(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\n"
+        "Thank you for sharing the details.\n"
+        "Yes — we can make the insert in the exact size shown on our website.\n\n"
+        "Just to double check and avoid any issues with the replacement, could you please confirm whether this insert is intended for a different bag than the one selected on the listing? "
+        "The size shown in the listing usually refers to the bag model/size (not the exact insert dimensions), so I just want to make sure everything matches perfectly.\n\n"
+        f"{NO_RETURN_SENTENCE}\n"
+        "Once confirmed, we’ll arrange it right away and share the tracking as soon as it’s available.\n\n"
+        f"Warm regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_color_change_reply(first_name: str, color_hint: str = "") -> str:
+    g = greeting(first_name)
+    hint_line = f" (requested shade: {color_hint})" if color_hint else ""
+    return (
+        f"{g}\n\n"
+        "Thank you for reaching out — I’m so happy to hear you love the product! "
+        "Of course, we can help with a color change.\n\n"
+        "Just to confirm, could you please tell me the exact shade you’d like instead (the shade name as shown on the listing)?"
+        f"{hint_line}\n\n"
+        f"{NO_RETURN_SENTENCE}\n"
+        "Once confirmed, we’ll arrange it right away and share the tracking as soon as it’s available.\n\n"
+        f"Best regards,\n{SIGNATURE_NAME}"
+    )
+
 def greeting(first_name: str) -> str:
     name = first_name or "there"
     return f"Hi {name},"
@@ -674,6 +856,23 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     if any(word in text.lower() for word in SHADE_TRIGGERS):
         if not thread_has_any_photo(comments):
             return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_shade_photo_request(first_name)
+   
+    # --- Listing size mentioned + measurement mismatch (expected advertised size vs received size) ---
+    if is_listing_measurement_mismatch_case(text):
+        msg = build_listing_mismatch_reply(first_name)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+  
+    # --- Height adjustment request (taller / shorter) ---
+    height_case = detect_height_adjustment(text)
+    if height_case == "taller":
+        msg = build_height_taller_reply(first_name)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+    if height_case == "shorter":
+        msg = build_height_shorter_reply(first_name)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+    if height_case == "ambiguous":
+        msg = build_height_ambiguous_reply(first_name)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
     # Replacement esplicito (qualsiasi origine): diretto, breve — echo parole chiave (max 2)
     if explicit:
@@ -697,6 +896,12 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
         # Caso: solo domanda sul reso (no replacement esplicito)
     if RETURN_REQUEST_RE.search(text) and not explicit:
         return "[Suggested reply by ChatGPT — please review and send]\n\n" + build_return_only(first_name)
+  
+    # --- Prefer different color option / shade change (post-purchase) ---
+    if is_color_change_intent(text):
+        hint = extract_color_word(text)
+        msg = build_color_change_reply(first_name, hint)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
     # Informazioni minime mancanti (se non è esplicito NON facciamo eco keyword)
     if origin == "shopify":
