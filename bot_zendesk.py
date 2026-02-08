@@ -213,6 +213,18 @@ HEIGHT_SHORTER_TRIGGERS = {
     "too high", "sits too high"
 }
 
+# --- [NUOVO] MATCH A PAROLA INTERA SICURO ---
+def has_word(text: str, word: str) -> bool:
+    return re.search(rf"\b{re.escape(word)}\b", text or "", flags=re.I) is not None
+
+def contains_any_word(text: str, vocab: set) -> bool:
+    return any(has_word(text, w) for w in vocab)
+
+def contains_any(text: str, vocab: set) -> bool:
+    """Match 'largo' (sottostringa). Usato dove va bene. Evitare per taglie/colori."""
+    t = (text or "").lower()
+    return any(w in t for w in vocab)
+    
 def detect_height_adjustment(text: str) -> Optional[str]:
     """
     Returns:
@@ -370,18 +382,6 @@ def is_pure_thanks(text: str) -> bool:
         return False
 
     return True
-
-# --- [NUOVO] MATCH A PAROLA INTERA SICURO ---
-def has_word(text: str, word: str) -> bool:
-    return re.search(rf"\b{re.escape(word)}\b", text or "", flags=re.I) is not None
-
-def contains_any_word(text: str, vocab: set) -> bool:
-    return any(has_word(text, w) for w in vocab)
-
-def contains_any(text: str, vocab: set) -> bool:
-    """Match 'largo' (sottostringa). Usato dove va bene. Evitare per taglie/colori."""
-    t = (text or "").lower()
-    return any(w in t for w in vocab)
 
 def extract_order_number(text: str) -> Optional[str]:
     if not text: return None
