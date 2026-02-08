@@ -171,6 +171,26 @@ def extract_measurement_sets(text: str) -> list:
 
     return out
 
+def is_listing_measurement_mismatch_case(text: str) -> bool:
+    """
+    Caso: cliente dice che le misure in listing/website sono X ma ha ricevuto Y.
+    Heuristica: serve contesto listing/website + almeno 2 set di misure nel testo (o “instead” + misure).
+    """
+    if not text:
+        return False
+    t = text.lower()
+
+    # contesto: listing / website / advertised / supposed to / incorrect
+    context = any(kw in t for kw in [
+        "website", "listing", "advertis", "shown on", "measurements listed",
+        "supposed to", "should be", "incorrect", "listed incorrectly", "description"
+    ])
+
+    measures = extract_measurement_sets(text)
+    has_mismatch_signal = (len(measures) >= 2) or (("instead" in t) and len(measures) >= 1)
+
+    return context and has_mismatch_signal
+
 SHOPIFY_CONTACT_PHRASE = "you received a new message from your online store's contact form"
 
 COLOR_WORDS = {"black","white","brown","dark brown","beige","sienna","red","blue","navy","tan","camel",
