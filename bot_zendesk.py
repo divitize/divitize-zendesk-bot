@@ -242,6 +242,30 @@ def detect_height_adjustment(text: str) -> Optional[str]:
 
     return None
 
+def is_generic_fit_issue(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.lower()
+
+    fit_triggers = [
+        "doesn't fit", "does not fit", "not a good fit",
+        "doesnt fit", "not fitting", "fit issue", "doesn't work"
+    ]
+
+    # dice che non fitta
+    has_fit_problem = any(p in t for p in fit_triggers)
+
+    # ma NON spiega come
+    has_specifics = (
+        detect_height_adjustment(text) is not None
+        or has_measurements(text)
+        or contains_any_word(t, LONG_WORDS | SHORT_WORDS)
+        or contains_any_word(t, {"width", "depth", "too wide", "too deep"})
+    )
+
+    return has_fit_problem and not has_specifics
+
 PREFER_IN_RE = re.compile(
     r"\b(i\s+would\s+prefer|would\s+prefer|i\s+prefer|prefer)\b.*\b(in|to)\b",
     re.I
@@ -418,6 +442,31 @@ def is_explicit_request(text: str) -> bool:
         text_has_size_word_strict(t) or contains_any_word(t, COLOR_WORDS) or contains_any_word(t, CHAIN_WORDS)
     )
 
+VAGUE_ONLY_RE = re.compile(r"^\s*(test|hello|hi|hey|help|please help|question|info)\s*\.?\s*$", re.I)
+
+def is_low_information_message(text: str) -> bool:
+    """
+    True se il messaggio è troppo corto/generico e non contiene richieste chiare.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if VAGUE_ONLY_RE.match(t):
+        return True
+
+    # se non ha misure, link, ordine, parole chiave, ecc. ed è molto corto
+    too_short = len(t) < 25
+    has_any_signal = (
+        bool(ORDER_PAT.search(t)) or
+        has_link(t) or
+        has_measurements(t) or
+        ("fit" in t.lower()) or
+        is_explicit_request(t) or
+        is_color_change_intent(t) or
+        RETURN_REQUEST_RE.search(t) is not None
+    )
+    return too_short and not has_any_signal
+
 def has_compliment(text: str) -> bool:
     return contains_any(text, POSITIVE_WORDS)
 
@@ -473,6 +522,28 @@ except Exception as e:
     client = None
 
 # ============ BUILDERS DI MESSAGGIO ============
+def has_fit_issue_signal(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    fit_triggers = [
+        "doesn't fit", "does not fit", "doesnt fit",
+        "not a good fit", "not fitting", "fit issue",
+        "doesn't work", "does not work", "not working",
+        "too small", "too big"
+    ]
+    return any(p in t for p in fit_triggers)
+
+def build_neutral_clarification_reply(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\n"
+        "Thank you for reaching out!\n\n"
+        "Could you please let me know how I can help you today?  \n"
+        "I’ll be happy to assist as soon as I have a bit more information.\n\n"
+        f"Best regards,\n{SIGNATURE_NAME}"
+    )
+
 def build_height_taller_reply(first_name: str) -> str:
     g = greeting(first_name)
     return (
@@ -519,6 +590,22 @@ def build_listing_mismatch_reply(first_name: str) -> str:
         f"{NO_RETURN_SENTENCE}\n"
         "Once confirmed, we’ll arrange it right away and share the tracking as soon as it’s available.\n\n"
         f"Warm regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_fit_issue_no_details_reply(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\n"
+        "Thank you for your message. I understand that the insert doesn’t fit your bag as expected, "
+        "and I’ll be happy to help you get the perfect replacement.\n\n"
+        "First, just to confirm: is the bag you’re using the same model and size shown on the listing, "
+        "or is it a different model? This will help me understand the reason for the fit issue.\n\n"
+        "To proceed correctly, could you please send a photo showing how the insert fits inside your bag? "
+        "This is essential for us to see exactly what needs to be adjusted.\n\n"
+        "If you can also let me know what feels off — for example, if it’s too tall, too short, "
+        "or if the depth or width isn’t quite right — that would be very helpful.\n\n"
+        f"{NO_RETURN_SENTENCE}\n\n"
+        f"Best regards,\n{SIGNATURE_NAME}"
     )
 
 def build_color_change_reply(first_name: str, color_hint: str = "") -> str:
@@ -616,6 +703,20 @@ def build_need_info_shopify(first_name: str, need_model_link: bool, order_presen
     return (
         f"{g}\n\nThanks for your message! To make sure the fit is perfect, could you please share {ask_line}? "
         f"{thanks_photo}{NO_RETURN_SENTENCE}\n\nBest regards,\n{SIGNATURE_NAME}"
+    )
+
+def build_clarify_fit_issue_reply(first_name: str) -> str:
+    g = greeting(first_name)
+    return (
+        f"{g}\n\n"
+        "Thank you for reaching out. I’m sorry the insert doesn’t feel like the right fit.\n\n"
+        "To fix this quickly, could you please confirm:\n"
+        "1) Is this the same bag model/size shown on the listing, or a different one?\n"
+        "2) What exactly feels off — is it too tall/too short, too wide, too deep, or too tight/loose inside the bag?\n\n"
+        "Please also send a clear photo of the organizer placed inside your bag (top view is best). "
+        "This is necessary for us to craft the correct replacement.\n\n"
+        f"{NO_RETURN_SENTENCE}\n\n"
+        f"Best regards,\n{SIGNATURE_NAME}"
     )
 
 def build_shopify_materials(first_name: str, bag_model: Optional[str], with_thanks: bool) -> str:
@@ -921,6 +1022,21 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     if is_color_change_intent(text):
         hint = extract_color_word(text)
         msg = build_color_change_reply(first_name, hint)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+
+    # --- messaggio neutro / troppo generico: non assumiamo nessun problema ---
+    if is_low_information_message(text) and not has_fit_issue_signal(text):
+        msg = build_neutral_clarification_reply(first_name)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+
+    # --- fit issue generico (cliente dice che non fitta ma non spiega) ---
+    if is_generic_fit_issue(text):
+        msg = build_fit_issue_no_details_reply(first_name)
+        return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
+
+    # --- fit issue ma ancora troppo vago: chiediamo dettagli + foto (solo se ha segnale fit) ---
+    if has_fit_issue_signal(text) and is_low_information_message(text) and not message_has_photo(last):
+        msg = build_clarify_fit_issue_reply(first_name)
         return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
     # Informazioni minime mancanti (se non è esplicito NON facciamo eco keyword)
