@@ -12,7 +12,7 @@ for comparison, but is not called.
 New settings:
 
 - `OPENAI_DRAFTS_ENABLED=true` enables the AI draft path. It defaults to `false`.
-- `DRAFT_OPENAI_MODEL` defaults to `gpt-6-astra`.
+- Draft generation is locked to `gpt-6.1-sol`; model environment overrides are ignored.
 - `DRAFT_REASONING_EFFORT` defaults to `medium`.
 - `OPENAI_API_KEY` is still required by the existing service configuration.
 
