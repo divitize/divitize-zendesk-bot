@@ -16,7 +16,7 @@ Z_EMAIL       = os.getenv("ZENDESK_EMAIL", "").strip()
 Z_API_TOKEN   = os.getenv("ZENDESK_API_TOKEN", "").strip()
 
 OPENAI_APIKEY = os.getenv("OPENAI_API_KEY", "").strip()
-DRAFT_OPENAI_MODEL = os.getenv("DRAFT_OPENAI_MODEL", "gpt-6.1-sol").strip()
+DRAFT_OPENAI_MODEL = "gpt-6.1-sol"
 DRAFT_REASONING_EFFORT = os.getenv("DRAFT_REASONING_EFFORT", "medium").strip()
 # Keep new AI drafts off until the separate version is tested and explicitly enabled.
 OPENAI_DRAFTS_ENABLED = os.getenv("OPENAI_DRAFTS_ENABLED", "false").strip().lower() == "true"
