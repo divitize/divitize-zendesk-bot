@@ -884,6 +884,18 @@ def current_sent_tracking_tag(tags: List[str]) -> Optional[str]:
             return t
     return None
 
+
+CREATOR_TRACKING_RE = re.compile(
+    r"\b(?:collab(?:oration|orate|orating)?|influencer|content creator|ugc|shoppable video|commission)\b",
+    re.I,
+)
+
+
+def is_creator_conversation(comments: List[Dict[str, Any]]) -> bool:
+    """Fail closed: a creator gift must not receive the customer-replacement template."""
+    return any(c.get("public") and CREATOR_TRACKING_RE.search(c.get("body") or "")
+               for c in comments)
+
 def extract_tracking_from_guard(tag: str) -> str:
     # guard è tracking_sent_<normalized>
     return tag[len(TRACKING_SENT_PREFIX):] if tag and tag.startswith(TRACKING_SENT_PREFIX) else ""
@@ -891,17 +903,18 @@ def extract_tracking_from_guard(tag: str) -> str:
 def normalize_tag(s: str) -> str:
     return re.sub(r'[^a-z0-9_]', '', (s or '').lower())
 
-def last_public_comment_contains_tracking(comments: List[Dict[str,Any]], tracking: str) -> bool:
-    if not comments: return False
+def last_public_comment_contains_tracking(comments: List[Dict[str,Any]], tracking: str,
+                                          requester_id: Optional[int] = None) -> bool:
+    """Check the latest *agent tracking announcement*, not a customer's quotation."""
+    if not comments:
+        return False
     key = normalize_tag(tracking)
     for c in reversed(comments):
-        if c.get("public"):
-            body = (c.get("body") or "")
-            if key in normalize_tag(body):
-                return True
-            if f"nums={normalize_tag(tracking)}" in normalize_tag(body):
-                return True
-            return False
+        if not c.get("public") or c.get("author_id") == requester_id:
+            continue
+        body = c.get("body") or ""
+        if "tracking number for your replacement" in body.lower():
+            return bool(key and key in normalize_tag(body))
     return False
 
 # ============ COMPOSIZIONE BOZZE ============
@@ -1167,58 +1180,45 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
     Ritorna True se ha pubblicato o retro-taggato; False se non ha fatto nulla.
     """
     ticket_id = ticket["id"]
+    # The caller's snapshot can be stale after another poll or agent action.
+    ticket = fetch_ticket(ticket_id)
+    if ticket.get("status") == "closed":
+        return False
     requester_id = ticket.get("requester_id")
-    first_name = get_user_first_name(requester_id)
     tags = ticket.get("tags") or []
     current_tracking = get_custom_field_value(ticket, Z_TRACKING_FIELD) if Z_TRACKING_FIELD else None
     if not current_tracking:
         return False
 
     current_guard = TRACKING_SENT_PREFIX + normalize_tag(current_tracking)
-    existing_guard = current_sent_tracking_tag(tags)  # es. tracking_sent_uk4246...
-
-    comments = get_ticket_comments(ticket_id)
-
-    # Caso: esiste già un guard ma è DIVERSO -> correzione tracking
-    if existing_guard and existing_guard != current_guard:
-        # Se abbiamo già inviato questa correzione (cioè il nuovo guard è presente), non ripetere
-        if current_guard in tags or last_public_comment_contains_tracking(comments, current_tracking):
-            ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-            remove_tags(ticket_id, [existing_guard])
-            print(f"[OK] Tracking correction retro-tagged on ticket {ticket_id}")
-            try:
-                z_put(f"/tickets/{ticket_id}.json", {"ticket": {"status": "solved"}})
-            except Exception:
-                pass
-            return True
-
-        # Invia messaggio di correzione
-        body = build_public_tracking_correction_message(current_tracking, first_name)
-        add_public_reply_and_tags(ticket_id, body, [TAG_REPLACEMENT_SENT, current_guard], set_status="solved")
-        ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-        remove_tags(ticket_id, [existing_guard])
-        print(f"[OK] Tracking CORRECTED and solved for ticket {ticket_id}")
-        return True
-
-    # Caso: esiste guard uguale → già inviato, non fare nulla
-    if existing_guard == current_guard:
+    old_guards = [tag for tag in tags if tag.startswith(TRACKING_SENT_PREFIX)]
+    if current_guard in old_guards and len(old_guards) == 1 and ticket.get("status") == "solved":
         return False
 
-    # Caso: nessun guard presente -> prima comunicazione
-    if last_public_comment_contains_tracking(comments, current_tracking):
-        ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-        try:
-            z_put(f"/tickets/{ticket_id}.json", {"ticket": {"status": "solved"}})
-        except Exception:
-            pass
-        print(f"[OK] Retro-tag guard + replacement_sent on ticket {ticket_id}")
-        return True
+    comments = get_ticket_comments(ticket_id)
+    if is_creator_conversation(comments):
+        print(f"[INFO] Creator ticket {ticket_id}: tracking requires human handling")
+        return False
 
-    # invio standard
-    body = build_public_tracking_message(current_tracking, first_name)
-    add_public_reply_and_tags(ticket_id, body, [TAG_REPLACEMENT_SENT, current_guard], set_status="solved")
-    ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-    print(f"[OK] Tracking published + solved + tags forced for ticket {ticket_id}")
+    already_announced = current_guard in old_guards or last_public_comment_contains_tracking(
+        comments, current_tracking, requester_id)
+    updated_at = ticket.get("updated_at")
+    if not updated_at:
+        raise ValueError(f"Ticket {ticket_id} has no updated_at for a safe update")
+    new_tags = sorted((set(tags) - set(old_guards)) | {TAG_REPLACEMENT_SENT, current_guard})
+    update: Dict[str, Any] = {
+        "tags": new_tags, "status": "solved", "safe_update": True,
+        "updated_stamp": updated_at,
+    }
+    if not already_announced:
+        first_name = get_user_first_name(requester_id)
+        body = (build_public_tracking_correction_message(current_tracking, first_name)
+                if old_guards else build_public_tracking_message(current_tracking, first_name))
+        update["comment"] = {"public": True, "body": body}
+    # Comment, guard tag and solved status are one protected Zendesk update.
+    # On a 409/timeout, the next poll re-reads the ticket before deciding again.
+    z_put(f"/tickets/{ticket_id}.json", {"ticket": update})
+    print(f"[OK] Tracking {'reconciled' if already_announced else 'published'} for ticket {ticket_id}")
     return True
 
 # ============ CICLO PRINCIPALE ============

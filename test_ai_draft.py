@@ -57,6 +57,9 @@ RESULT = {"route": "support", "reply": "Hi Maya, we can correct the length.",
 
 
 class AIDraftTests(unittest.TestCase):
+    def test_bot_model_is_locked_to_sol(self):
+        self.assertEqual(bot.DRAFT_OPENAI_MODEL, "gpt-6.1-sol")
+
     def test_openai_call_is_structured_and_excludes_old_private_bot_note(self):
         client = FakeClient(RESULT)
         private = {"id": 70, "author_id": 99, "public": False,
@@ -66,6 +69,7 @@ class AIDraftTests(unittest.TestCase):
         self.assertEqual(result["reply"], RESULT["reply"])
         self.assertEqual(len(client.calls), 1)
         request = client.calls[0]
+        self.assertEqual(request["model"], "gpt-6.1-sol")
         self.assertEqual(request["reasoning"], {"effort": "medium"})
         self.assertIs(request["store"], False)
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
@@ -88,6 +92,13 @@ class AIDraftTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             generate_draft(FakeClient({**RESULT, "reply": ""}), "gpt-6.1-sol", "medium",
                            TICKET, [CUSTOMER], "Maya", "generic_email")
+
+    def test_astra_is_blocked_before_any_api_call(self):
+        client = FakeClient(RESULT)
+        with self.assertRaisesRegex(RuntimeError, "model is disabled"):
+            generate_draft(client, "gpt-6-astra", "medium", TICKET,
+                           [CUSTOMER], "Maya", "generic_email")
+        self.assertEqual(client.calls, [])
 
     def test_comment_pagination(self):
         first = {"comments": [{"id": n} for n in range(100)],
@@ -145,6 +156,126 @@ class AIDraftTests(unittest.TestCase):
               patch.object(bot, "z_put") as put):
             bot.ensure_tags(42, ["source_shopify_form"])
         put.assert_not_called()
+
+    def tracking_ticket(self, number, tags=None):
+        return {**TICKET, "custom_fields": [{"id": "tracking_field", "value": number}],
+                "tags": tags or []}
+
+    def test_tracking_first_send_is_atomic_and_safe(self):
+        ticket = self.tracking_ticket("ABC123")
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.handle_tracking_if_any(ticket))
+        put.assert_called_once()
+        update = put.call_args.args[1]["ticket"]
+        self.assertTrue(update["safe_update"])
+        self.assertEqual(update["updated_stamp"], TICKET["updated_at"])
+        self.assertEqual(update["status"], "solved")
+        self.assertTrue(update["comment"]["public"])
+        self.assertIn("tracking_sent_abc123", update["tags"])
+        self.assertIn("replacement_sent", update["tags"])
+
+    def test_tracking_correction_replaces_old_guard_once(self):
+        ticket = self.tracking_ticket("NEW456", ["tracking_sent_old123", "other"])
+        previous = {"id": 72, "author_id": 99, "public": True,
+                    "body": bot.build_public_tracking_message("OLD123", "Maya")}
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER, previous]),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.handle_tracking_if_any(ticket))
+        update = put.call_args.args[1]["ticket"]
+        self.assertIn("Please disregard", update["comment"]["body"])
+        self.assertIn("tracking_sent_new456", update["tags"])
+        self.assertNotIn("tracking_sent_old123", update["tags"])
+        self.assertIn("other", update["tags"])
+
+    def test_existing_guard_never_sends_tracking_again(self):
+        ticket = {**self.tracking_ticket("ABC123", ["tracking_sent_abc123"]), "status": "solved"}
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments") as comments,
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.handle_tracking_if_any(ticket))
+        put.assert_not_called()
+        comments.assert_not_called()
+
+    def test_existing_guard_on_open_ticket_only_solves_it(self):
+        ticket = self.tracking_ticket("ABC123", ["tracking_sent_abc123"])
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.handle_tracking_if_any(ticket))
+        update = put.call_args.args[1]["ticket"]
+        self.assertEqual(update["status"], "solved")
+        self.assertNotIn("comment", update)
+
+    def test_customer_quoting_tracking_is_not_proof_of_an_agent_send(self):
+        ticket = self.tracking_ticket("ABC123")
+        quoted = {**CUSTOMER, "body": "You promised tracking ABC123, where is it?"}
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[quoted]),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "z_put") as put):
+            bot.handle_tracking_if_any(ticket)
+        self.assertIn("comment", put.call_args.args[1]["ticket"])
+
+    def test_creator_gift_does_not_receive_replacement_tracking(self):
+        ticket = self.tracking_ticket("ABC123")
+        creator = {**CUSTOMER, "body": "I'd love to collaborate on TikTok content."}
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[creator]),
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.handle_tracking_if_any(ticket))
+        put.assert_not_called()
+
+    def test_timeout_reconciles_from_saved_agent_comment_without_resending(self):
+        ticket = self.tracking_ticket("ABC123")
+        sent = {"id": 72, "author_id": 99, "public": True,
+                "body": bot.build_public_tracking_message("ABC123", "Maya")}
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER, sent]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.handle_tracking_if_any(ticket))
+        update = put.call_args.args[1]["ticket"]
+        self.assertNotIn("comment", update)
+        self.assertIn("tracking_sent_abc123", update["tags"])
+
+    def test_tracking_conflict_does_not_blindly_retry(self):
+        ticket = self.tracking_ticket("ABC123")
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "z_put", side_effect=RuntimeError("409 Conflict")) as put):
+            with self.assertRaisesRegex(RuntimeError, "409 Conflict"):
+                bot.handle_tracking_if_any(ticket)
+        put.assert_called_once()
+
+    def test_tracking_a_to_b_to_a_is_a_new_correction(self):
+        ticket = self.tracking_ticket("A123", ["tracking_sent_b456"])
+        previous = {"id": 72, "author_id": 99, "public": True,
+                    "body": bot.build_public_tracking_correction_message("B456", "Maya")}
+        older = {"id": 70, "author_id": 99, "public": True,
+                 "body": bot.build_public_tracking_message("A123", "Maya")}
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[older, previous]),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "z_put") as put):
+            bot.handle_tracking_if_any(ticket)
+        update = put.call_args.args[1]["ticket"]
+        self.assertIn("Please disregard", update["comment"]["body"])
+        self.assertEqual([t for t in update["tags"] if t.startswith("tracking_sent_")],
+                         ["tracking_sent_a123"])
 
 
 if __name__ == "__main__":
