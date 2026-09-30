@@ -67,8 +67,8 @@ def generate_draft(client: Any, model: str, reasoning_effort: str,
                    ticket: Dict[str, Any], comments: List[Dict[str, Any]],
                    first_name: str, source_hint: str) -> Dict[str, Any]:
     """Call OpenAI once and return a structured proposed reply; no Zendesk side effects."""
-    if client is None:
-        raise RuntimeError("OpenAI client is unavailable; no draft was created")
+    if model.strip().lower() == "gpt-6-astra" or client is None:
+        raise RuntimeError("OpenAI client is unavailable or model is disabled; no draft was created")
     case_data = public_case_data(ticket, comments, first_name, source_hint)
     if not case_data["conversation"]:
         raise ValueError("Cannot draft without a public conversation")
