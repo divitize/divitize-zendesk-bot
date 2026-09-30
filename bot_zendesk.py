@@ -8,6 +8,7 @@ import requests
 from typing import List, Dict, Any, Optional
 from flask import Flask, jsonify
 from openai import OpenAI
+from openai_draft import POLICY_VERSION, generate_draft
 
 # ============ ENV ============
 Z_SUBDOMAIN   = os.getenv("ZENDESK_SUBDOMAIN", "").strip()
@@ -15,7 +16,10 @@ Z_EMAIL       = os.getenv("ZENDESK_EMAIL", "").strip()
 Z_API_TOKEN   = os.getenv("ZENDESK_API_TOKEN", "").strip()
 
 OPENAI_APIKEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # tenuto per eventuali futuri usi
+DRAFT_OPENAI_MODEL = os.getenv("DRAFT_OPENAI_MODEL", "gpt-6-astra").strip()
+DRAFT_REASONING_EFFORT = os.getenv("DRAFT_REASONING_EFFORT", "medium").strip()
+# Keep new AI drafts off until the separate version is tested and explicitly enabled.
+OPENAI_DRAFTS_ENABLED = os.getenv("OPENAI_DRAFTS_ENABLED", "false").strip().lower() == "true"
 
 BRAND_NAME     = os.getenv("BRAND_NAME", "Divitize").strip()
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Noe").strip()
@@ -65,7 +69,21 @@ def fetch_ticket(ticket_id: int) -> Dict[str, Any]:
     return z_get(f"/tickets/{ticket_id}.json").get("ticket", {})
 
 def get_ticket_comments(ticket_id: int) -> List[Dict[str, Any]]:
-    return z_get(f"/tickets/{ticket_id}/comments.json").get("comments", [])
+    comments: List[Dict[str, Any]] = []
+    cursor = None
+    while True:
+        params = {"page[size]": 100}
+        if cursor:
+            params["page[after]"] = cursor
+        page = z_get(f"/tickets/{ticket_id}/comments.json", params)
+        comments.extend(page.get("comments") or [])
+        meta = page.get("meta") or {}
+        if not meta.get("has_more"):
+            return comments
+        next_cursor = meta.get("after_cursor")
+        if not next_cursor or next_cursor == cursor:
+            raise RuntimeError(f"Zendesk comments pagination stalled for ticket {ticket_id}")
+        cursor = next_cursor
 
 def add_internal_note_and_tags(ticket_id: int, note: str, tags: List[str]):
     payload = {"ticket": {"comment": {"public": False, "body": note}, "additional_tags": tags}}
@@ -90,7 +108,8 @@ def ensure_tags(ticket_id: int, new_tags: List[str]):
     try:
         existing = get_ticket_tags(ticket_id)
         merged = sorted(set((existing or []) + (new_tags or [])))
-        z_put(f"/tickets/{ticket_id}.json", {"ticket": {"tags": merged}})
+        if set(existing) != set(merged):
+            z_put(f"/tickets/{ticket_id}.json", {"ticket": {"tags": merged}})
     except Exception as e:
         print(f"[WARN] ensure_tags failed on {ticket_id}: {e}")
 
@@ -512,11 +531,11 @@ def tag_origin(ticket_id: int, origin: str):
     else:
         ensure_tags(ticket_id, ["source_generic_email"])
 
-# ============ OPENAI (placeholder per futuri usi) ============
+# ============ OPENAI ============
 client = None
 try:
     if OPENAI_APIKEY:
-        client = OpenAI(api_key=OPENAI_APIKEY)
+        client = OpenAI(api_key=OPENAI_APIKEY, timeout=60, max_retries=1)
 except Exception as e:
     print(f"[WARN] OpenAI init failed: {e}")
     client = None
@@ -886,7 +905,7 @@ def last_public_comment_contains_tracking(comments: List[Dict[str,Any]], trackin
     return False
 
 # ============ COMPOSIZIONE BOZZE ============
-def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
+def compose_legacy_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     last = comments[-1]
     text = (last.get("body") or "").strip()
     requester_id = ticket.get("requester_id")
@@ -1058,6 +1077,81 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
 
     return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
+def draft_marker(comment_id: int) -> str:
+    return f"AI_DRAFT_FOR_CUSTOMER_COMMENT_ID={comment_id}"
+
+
+def draft_guard_tag(comment_id: int) -> str:
+    return f"ai_draft_comment_{comment_id}"
+
+
+def already_drafted_for_comment(comments: List[Dict[str, Any]], comment_id: int) -> bool:
+    marker = draft_marker(comment_id)
+    return any(not c.get("public") and marker in (c.get("body") or "") for c in comments)
+
+
+def compose_openai_draft(ticket: Dict[str, Any], comments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Generate a new reply from case context, never a canned-template fallback."""
+    public_comments = [c for c in comments if c.get("public")]
+    origin_hint = classify_origin(ticket, public_comments)
+    first_name = (extract_first_name_from_shopify_body(public_comments) if origin_hint == "shopify" else None)
+    first_name = first_name or get_user_first_name(ticket.get("requester_id"))
+    return generate_draft(client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT,
+                          ticket, comments, first_name, origin_hint)
+
+
+def format_internal_draft(customer_comment_id: int, result: Dict[str, Any]) -> str:
+    checks = result.get("facts_to_verify") or []
+    checks_text = "\n".join(f"- {item}" for item in checks) if checks else "- None identified"
+    return (
+        f"{draft_marker(customer_comment_id)}\n"
+        f"Policy: {POLICY_VERSION} | Route: {result['route']} | "
+        f"Human decision: {'yes' if result['needs_human_decision'] else 'no'}\n\n"
+        "PROPOSED CUSTOMER REPLY — review and send manually:\n"
+        f"{result['reply'].strip()}\n\n"
+        "AGENT NOTES — do not send:\n"
+        f"{result['agent_note'].strip()}\n"
+        f"Verify:\n{checks_text}"
+    )
+
+
+def post_internal_draft_once(ticket_id: int, customer_comment_id: int,
+                             result: Dict[str, Any]) -> bool:
+    """Recheck the ticket and atomically add one private draft for this customer message.
+
+    A Zendesk 409 conflict is intentionally allowed to bubble up; the next poll
+    re-reads comments before considering another write. An uncertain timeout is
+    handled the same way, so a successful-but-timed-out note is not repeated.
+    """
+    fresh_ticket = fetch_ticket(ticket_id)
+    fresh_comments = get_ticket_comments(ticket_id)
+    if fresh_ticket.get("status") in ("solved", "closed"):
+        return False
+    if draft_guard_tag(customer_comment_id) in (fresh_ticket.get("tags") or []):
+        return False
+    if already_drafted_for_comment(fresh_comments, customer_comment_id):
+        return False
+    if not last_is_end_user_public(fresh_ticket, fresh_comments):
+        return False
+    if fresh_comments[-1].get("id") != customer_comment_id:
+        return False
+    # Honor drafts made by the old bot during the transition.
+    if DRAFT_TAG in (fresh_ticket.get("tags") or []) and not user_wrote_after_last_internal(
+            fresh_comments, fresh_ticket.get("requester_id")):
+        return False
+    updated_at = fresh_ticket.get("updated_at")
+    if not updated_at:
+        raise ValueError(f"Ticket {ticket_id} has no updated_at for a safe update")
+    payload = {"ticket": {
+        "comment": {"public": False, "body": format_internal_draft(customer_comment_id, result)},
+        "additional_tags": [DRAFT_TAG, draft_guard_tag(customer_comment_id)],
+        "safe_update": True,
+        "updated_stamp": updated_at,
+    }}
+    z_put(f"/tickets/{ticket_id}.json", payload)
+    return True
+
+
 # ============ TRACKING: INVIO, CORREZIONE, ANTI-SPAM ============
 def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
     """
@@ -1151,7 +1245,11 @@ def process_once():
         except Exception as e:
             print(f"[ERROR tracking] {t.get('id')}: {e}")
 
-    # 2) Bozze interne (risposte) solo quando serve
+    # 2) AI drafts are opt-in; the existing public tracking path above is unchanged.
+    if not OPENAI_DRAFTS_ENABLED:
+        return
+
+    # 3) Bozze interne (risposte) solo quando serve
     for t in list_recent_tickets():
         ticket_id = t["id"]
         status = t.get("status")
@@ -1177,9 +1275,12 @@ def process_once():
 
         try:
             full = fetch_ticket(ticket_id)
-            draft = compose_draft(full, comments)
-            add_internal_note_and_tags(ticket_id, draft, [DRAFT_TAG])
-            print(f"[OK] Draft created for ticket {ticket_id}")
+            customer_comment_id = comments[-1].get("id")
+            if customer_comment_id is None or already_drafted_for_comment(comments, customer_comment_id):
+                continue
+            result = compose_openai_draft(full, comments)
+            if post_internal_draft_once(ticket_id, customer_comment_id, result):
+                print(f"[OK] AI draft created for ticket {ticket_id}, comment {customer_comment_id}")
         except Exception as e:
             print(f"[ERROR draft] {ticket_id}: {e}")
 
