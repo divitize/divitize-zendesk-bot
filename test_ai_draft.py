@@ -60,6 +60,7 @@ class AIDraftTests(unittest.TestCase):
     def test_order_number_extraction_is_conservative(self):
         cases = [
             ("Amazon Order Number: [Your112-5428578-9415428]", ["112-5428578-9415428"]),
+            ("Amazon order number: 113-4771136-5412247", ["113-4771136-5412247"]),
             ("My order #1234 arrived yesterday", ["#1234"]),
             ("Order number: 23456", ["23456"]),
             ("Order ID is 34567", ["34567"]),
