@@ -19,6 +19,18 @@ New settings:
 - `DRAFT_REASONING_EFFORT` defaults to `medium`.
 - `OPENAI_API_KEY` is still required by the existing service configuration.
 
+Private-draft trial on a Render pull-request preview:
+
+- A preview (`IS_PULL_REQUEST=true`) never runs the normal origin-tagging or
+  public tracking loops, even if production environment settings are copied.
+- It does nothing until `PILOT_PRIVATE_DRAFTS_ENABLED=true` and
+  `PILOT_TICKET_IDS` contains one to three distinct numeric ticket IDs.
+- It can add only one private draft per selected ticket, marked with
+  `ai_private_draft_pilot_done`. It never changes status or sends a public reply.
+- Disable the preview after the trial so it does not continue consuming Render
+  free-instance hours. Never enable the pilot variables on the production
+  service as a substitute for a preview.
+
 Before enabling this on Render: verify model access and spending limits, test
 draft quality on historical tickets, and make sure only one bot instance is
 running. The safeguards have offline tests, but they have not been tested

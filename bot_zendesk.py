@@ -20,6 +20,10 @@ DRAFT_OPENAI_MODEL = "gpt-6.1-sol"
 DRAFT_REASONING_EFFORT = os.getenv("DRAFT_REASONING_EFFORT", "medium").strip()
 # Keep new AI drafts off until the separate version is tested and explicitly enabled.
 OPENAI_DRAFTS_ENABLED = os.getenv("OPENAI_DRAFTS_ENABLED", "false").strip().lower() == "true"
+IS_PULL_REQUEST = os.getenv("IS_PULL_REQUEST", "false").strip().lower() == "true"
+PILOT_PRIVATE_DRAFTS_ENABLED = os.getenv("PILOT_PRIVATE_DRAFTS_ENABLED", "false").strip().lower() == "true"
+PILOT_TICKET_IDS = os.getenv("PILOT_TICKET_IDS", "").strip()
+PILOT_DONE_TAG = "ai_private_draft_pilot_done"
 
 BRAND_NAME     = os.getenv("BRAND_NAME", "Divitize").strip()
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Noe").strip()
@@ -1129,7 +1133,7 @@ def format_internal_draft(customer_comment_id: int, result: Dict[str, Any]) -> s
 
 
 def post_internal_draft_once(ticket_id: int, customer_comment_id: int,
-                             result: Dict[str, Any]) -> bool:
+                             result: Dict[str, Any], pilot: bool = False) -> bool:
     """Recheck the ticket and atomically add one private draft for this customer message.
 
     A Zendesk 409 conflict is intentionally allowed to bubble up; the next poll
@@ -1141,6 +1145,8 @@ def post_internal_draft_once(ticket_id: int, customer_comment_id: int,
     if fresh_ticket.get("status") in ("solved", "closed"):
         return False
     if draft_guard_tag(customer_comment_id) in (fresh_ticket.get("tags") or []):
+        return False
+    if pilot and PILOT_DONE_TAG in (fresh_ticket.get("tags") or []):
         return False
     if already_drafted_for_comment(fresh_comments, customer_comment_id):
         return False
@@ -1157,7 +1163,8 @@ def post_internal_draft_once(ticket_id: int, customer_comment_id: int,
         raise ValueError(f"Ticket {ticket_id} has no updated_at for a safe update")
     payload = {"ticket": {
         "comment": {"public": False, "body": format_internal_draft(customer_comment_id, result)},
-        "additional_tags": [DRAFT_TAG, draft_guard_tag(customer_comment_id)],
+        "additional_tags": [DRAFT_TAG, draft_guard_tag(customer_comment_id)]
+                           + ([PILOT_DONE_TAG] if pilot else []),
         "safe_update": True,
         "updated_stamp": updated_at,
     }}
@@ -1222,7 +1229,41 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
     return True
 
 # ============ CICLO PRINCIPALE ============
+def pilot_ticket_ids() -> List[int]:
+    """Allow at most three explicit tickets; a bad configuration makes no writes."""
+    parts = [part.strip() for part in PILOT_TICKET_IDS.split(",") if part.strip()]
+    if not parts or len(parts) > 3 or any(not part.isdecimal() for part in parts):
+        return []
+    ids = [int(part) for part in parts]
+    return ids if len(set(ids)) == len(ids) else []
+
+
+def process_private_draft_pilot_once():
+    """PR previews never send tracking, tag origins, or touch other tickets."""
+    if not PILOT_PRIVATE_DRAFTS_ENABLED:
+        return
+    for ticket_id in pilot_ticket_ids():
+        try:
+            ticket = fetch_ticket(ticket_id)
+            if ticket.get("status") in ("solved", "closed") or PILOT_DONE_TAG in (ticket.get("tags") or []):
+                continue
+            comments = get_ticket_comments(ticket_id)
+            if not comments or not last_is_end_user_public(ticket, comments):
+                continue
+            customer_comment_id = comments[-1].get("id")
+            if customer_comment_id is None or already_drafted_for_comment(comments, customer_comment_id):
+                continue
+            result = compose_openai_draft(ticket, comments)
+            if post_internal_draft_once(ticket_id, customer_comment_id, result, pilot=True):
+                print(f"[OK] Private pilot draft created for ticket {ticket_id}")
+        except Exception as e:
+            print(f"[ERROR private pilot] {ticket_id}: {e}")
+
+
 def process_once():
+    if IS_PULL_REQUEST:
+        process_private_draft_pilot_once()
+        return
     # 0) Tagga origine (Shopify / Amazon QR / generic) su tutti i ticket non-closed
     for t in list_recent_tickets():
         if t.get("status") == "closed":

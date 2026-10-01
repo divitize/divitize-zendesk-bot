@@ -157,6 +157,50 @@ class AIDraftTests(unittest.TestCase):
             bot.ensure_tags(42, ["source_shopify_form"])
         put.assert_not_called()
 
+    def test_preview_without_explicit_pilot_is_completely_read_only(self):
+        with (patch.object(bot, "IS_PULL_REQUEST", True),
+              patch.object(bot, "PILOT_PRIVATE_DRAFTS_ENABLED", False),
+              patch.object(bot, "list_recent_tickets") as recent,
+              patch.object(bot, "fetch_ticket") as fetch,
+              patch.object(bot, "z_put") as put):
+            bot.process_once()
+        recent.assert_not_called()
+        fetch.assert_not_called()
+        put.assert_not_called()
+
+    def test_pilot_rejects_missing_invalid_duplicate_or_too_many_ticket_ids(self):
+        for value in ("", "42,abc", "42,42", "1,2,3,4"):
+            with self.subTest(value=value), patch.object(bot, "PILOT_TICKET_IDS", value):
+                self.assertEqual(bot.pilot_ticket_ids(), [])
+
+    def test_preview_pilot_writes_only_one_private_note_to_allowlisted_ticket(self):
+        with (patch.object(bot, "IS_PULL_REQUEST", True),
+              patch.object(bot, "PILOT_PRIVATE_DRAFTS_ENABLED", True),
+              patch.object(bot, "PILOT_TICKET_IDS", "42"),
+              patch.object(bot, "list_recent_tickets") as recent,
+              patch.object(bot, "handle_tracking_if_any") as tracking,
+              patch.object(bot, "fetch_ticket", return_value=TICKET) as fetch,
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "compose_openai_draft", return_value=RESULT),
+              patch.object(bot, "z_put") as put):
+            bot.process_once()
+        recent.assert_not_called()
+        tracking.assert_not_called()
+        self.assertEqual(fetch.call_count, 2)
+        put.assert_called_once()
+        payload = put.call_args.args[1]["ticket"]
+        self.assertFalse(payload["comment"]["public"])
+        self.assertNotIn("status", payload)
+        self.assertIn(bot.PILOT_DONE_TAG, payload["additional_tags"])
+
+    def test_pilot_done_tag_prevents_further_drafts(self):
+        done = {**TICKET, "tags": [bot.PILOT_DONE_TAG]}
+        with (patch.object(bot, "fetch_ticket", return_value=done),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.post_internal_draft_once(42, 71, RESULT, pilot=True))
+        put.assert_not_called()
+
     def tracking_ticket(self, number, tags=None):
         return {**TICKET, "custom_fields": [{"id": "tracking_field", "value": number}],
                 "tags": tags or []}
