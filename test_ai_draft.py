@@ -79,6 +79,16 @@ class AIDraftTests(unittest.TestCase):
         self.assertEqual(len(case["conversation"]), 1)
         self.assertEqual(case["conversation"][0]["comment_id"], 71)
 
+    def test_prompt_keeps_internal_order_checks_out_of_customer_reply(self):
+        client = FakeClient(RESULT)
+        generate_draft(client, "gpt-6.1-sol", "medium", TICKET,
+                       [CUSTOMER], "Maya", "amazon_qr")
+        instructions = client.calls[0]["instructions"]
+        self.assertIn("put order/channel verification in facts_to_verify", instructions)
+        self.assertIn("Keep this internal check out of the customer-facing reply", instructions)
+        self.assertIn("tracking details will follow when the replacement ships", instructions)
+        self.assertIn("Do not claim that a tracking number already exists", instructions)
+
     def test_creator_route_always_requires_human_decision(self):
         client = FakeClient({**RESULT, "route": "creator"})
         result = generate_draft(client, "gpt-6.1-sol", "medium", TICKET,
