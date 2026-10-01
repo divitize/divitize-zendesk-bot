@@ -57,6 +57,84 @@ RESULT = {"route": "support", "reply": "Hi Maya, we can correct the length.",
 
 
 class AIDraftTests(unittest.TestCase):
+    def test_order_number_extraction_is_conservative(self):
+        cases = [
+            ("Amazon Order Number: [Your112-5428578-9415428]", ["112-5428578-9415428"]),
+            ("My order #1234 arrived yesterday", ["#1234"]),
+            ("Order number: 23456", ["23456"]),
+            ("Order ID is 34567", ["34567"]),
+            ("The insert is 2 cm short; tracking 123456789", []),
+            ("Order #1234 was wrong; it is order #5678", ["#1234", "#5678"]),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(bot.order_numbers_in_message(message), expected)
+
+    def test_order_number_only_from_customer_public_comments(self):
+        agent = {"id": 72, "author_id": 99, "public": True, "body": "Order #9999"}
+        private = {"id": 73, "author_id": 5, "public": False, "body": "Order #8888"}
+        customer = {**CUSTOMER, "body": "My order #1234"}
+        self.assertEqual(bot.customer_order_number([customer, agent, private], 5), "#1234")
+        self.assertIsNone(bot.customer_order_number([agent, private], 5))
+
+    def test_ambiguous_latest_customer_order_does_not_use_old_number(self):
+        old = {**CUSTOMER, "body": "Order #1234"}
+        new = {**CUSTOMER, "id": 74, "body": "Order #1234 or order #5678?"}
+        self.assertIsNone(bot.customer_order_number([old, new], 5))
+
+    def test_order_field_safe_update_has_no_comment_or_status_change(self):
+        ticket = {**TICKET, "custom_fields": [{"id": "29113177850258", "value": None},
+                                                  {"id": "tracking", "value": "TRACK123"}]}
+        customer = {**CUSTOMER, "body": "My Amazon order is 113-4771136-5412247"}
+        with (patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[customer]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.populate_order_number_if_missing(ticket, [customer]))
+        put.assert_called_once()
+        payload = put.call_args.args[1]["ticket"]
+        self.assertEqual(payload["custom_fields"], [{"id": 29113177850258,
+                                                      "value": "113-4771136-5412247"}])
+        self.assertTrue(payload["safe_update"])
+        self.assertEqual(payload["updated_stamp"], ticket["updated_at"])
+        self.assertNotIn("comment", payload)
+        self.assertNotIn("status", payload)
+        self.assertNotIn("tags", payload)
+
+    def test_existing_order_number_is_never_overwritten(self):
+        ticket = {**TICKET, "custom_fields": [{"id": "29113177850258",
+                                                  "value": "113-4771136-5412247"}]}
+        with (patch.object(bot, "fetch_ticket") as fetch,
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.populate_order_number_if_missing(ticket, [CUSTOMER]))
+        fetch.assert_not_called()
+        put.assert_not_called()
+
+    def test_order_number_rechecks_field_and_conversation_before_write(self):
+        candidate = {**CUSTOMER, "body": "Order #1234"}
+        filled = {**TICKET, "custom_fields": [{"id": "29113177850258", "value": "#9999"}]}
+        with (patch.object(bot, "fetch_ticket", return_value=filled),
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.populate_order_number_if_missing(TICKET, [candidate]))
+        put.assert_not_called()
+
+        changed = {**CUSTOMER, "body": "Order #5678"}
+        with (patch.object(bot, "fetch_ticket", return_value=TICKET),
+              patch.object(bot, "get_ticket_comments", return_value=[changed]),
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.populate_order_number_if_missing(TICKET, [candidate]))
+        put.assert_not_called()
+
+    def test_order_field_recheck_prevents_repeat_after_timeout(self):
+        customer = {**CUSTOMER, "body": "Order #1234"}
+        filled = {**TICKET, "custom_fields": [{"id": "29113177850258", "value": "#1234"}]}
+        with (patch.object(bot, "fetch_ticket", side_effect=[TICKET, filled]),
+              patch.object(bot, "get_ticket_comments", return_value=[customer]),
+              patch.object(bot, "z_put", side_effect=TimeoutError) as put):
+            with self.assertRaises(TimeoutError):
+                bot.populate_order_number_if_missing(TICKET, [customer])
+            self.assertFalse(bot.populate_order_number_if_missing(TICKET, [customer]))
+        put.assert_called_once()
+
     def test_bot_model_is_locked_to_sol(self):
         self.assertEqual(bot.DRAFT_OPENAI_MODEL, "gpt-6.1-sol")
 
