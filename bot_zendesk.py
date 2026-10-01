@@ -33,6 +33,8 @@ DRAFT_TAG      = os.getenv("DRAFT_TAG", "chat_suggested_draft").strip()
 
 # Custom field id per tracking (string ok; es: "29120306162322")
 Z_TRACKING_FIELD = os.getenv("Z_TRACKING_FIELD", "").strip()
+# Zendesk ticket field "Order Number" in the Divitize workspace.
+Z_ORDER_FIELD = os.getenv("Z_ORDER_FIELD", "29113177850258").strip()
 
 # Tags fissi
 TAG_REPLACEMENT_SENT = "replacement_sent"                 # usato per automazione review
@@ -146,7 +148,12 @@ def get_custom_field_value(ticket: Dict[str, Any], field_id: str) -> Optional[st
     return None
 
 # ============ HEURISTICHE DI TESTO ============
-ORDER_PAT = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")  # Amazon order
+ORDER_PAT = re.compile(r"(?<!\d)\d{3}-\d{7}-\d{7}\b")  # Amazon order (also inside form placeholder "Your112-...")
+# Other channels: require an explicit order label, never an unlabelled number.
+LABELED_ORDER_PAT = re.compile(
+    r"\border\s*(?:number|no\.?|id)?\s*(?::|=|\bis\b)?\s*(#?\d{3,9})\b(?!-\d)",
+    re.I,
+)
 URL_PAT = re.compile(r'https?://[^\s)>\]]+', re.I)
 MEASURES_PAT = re.compile(
     r'\b(\d{1,2}(\.\d{1,2})?)\s*[x×]\s*(\d{1,2}(\.\d{1,2})?)\s*[x×]\s*(\d{1,2}(\.\d{1,2})?)\b',
@@ -410,6 +417,53 @@ def extract_order_number(text: str) -> Optional[str]:
     if not text: return None
     m = ORDER_PAT.search(text.replace("\n"," "))
     return m.group(0) if m else None
+
+def order_numbers_in_message(text: str) -> List[str]:
+    """Return distinct recognizable order numbers in one customer message."""
+    text = text or ""
+    found = [match.group(0) for match in ORDER_PAT.finditer(text)]
+    found.extend(match.group(1) for match in LABELED_ORDER_PAT.finditer(text))
+    # A labelled Amazon order can also yield its first three digits; discard that fragment.
+    found = [value for value in found if not re.search(rf"\b{re.escape(value.lstrip('#'))}-\d", text)]
+    return list(dict.fromkeys(found))
+
+def customer_order_number(comments: List[Dict[str, Any]], requester_id: int) -> Optional[str]:
+    """Use the most recent customer message with exactly one recognizable order."""
+    for comment in reversed(comments):
+        if not comment.get("public") or comment.get("author_id") != requester_id:
+            continue
+        numbers = order_numbers_in_message(comment.get("body") or "")
+        if numbers:
+            return numbers[0] if len(numbers) == 1 else None
+    return None
+
+def populate_order_number_if_missing(ticket: Dict[str, Any],
+                                     comments: List[Dict[str, Any]]) -> bool:
+    """Fill only the empty Order Number field, using an optimistic Zendesk update.
+
+    Re-read both the field and customer conversation before writing. A 409 or
+    uncertain timeout is left for the next poll, which rechecks the field first.
+    No comment, status, tag, or other custom field is changed by this request.
+    """
+    if not Z_ORDER_FIELD or get_custom_field_value(ticket, Z_ORDER_FIELD):
+        return False
+    number = customer_order_number(comments, ticket.get("requester_id"))
+    if not number:
+        return False
+    fresh_ticket = fetch_ticket(ticket["id"])
+    if fresh_ticket.get("status") == "closed" or get_custom_field_value(fresh_ticket, Z_ORDER_FIELD):
+        return False
+    fresh_comments = get_ticket_comments(ticket["id"])
+    if customer_order_number(fresh_comments, fresh_ticket.get("requester_id")) != number:
+        return False
+    updated_at = fresh_ticket.get("updated_at")
+    if not updated_at:
+        raise ValueError(f"Ticket {ticket['id']} has no updated_at for a safe update")
+    z_put(f"/tickets/{ticket['id']}.json", {"ticket": {
+        "custom_fields": [{"id": int(Z_ORDER_FIELD), "value": number}],
+        "safe_update": True, "updated_stamp": updated_at,
+    }})
+    return True
 
 def has_link(text: str) -> bool:
     return bool(URL_PAT.search(text or ""))
@@ -1264,13 +1318,22 @@ def process_once():
     if IS_PULL_REQUEST:
         process_private_draft_pilot_once()
         return
-    # 0) Tagga origine (Shopify / Amazon QR / generic) su tutti i ticket non-closed
+    # 0) Fill an empty Order Number field, then tag origin, on non-closed tickets.
     for t in list_recent_tickets():
         if t.get("status") == "closed":
             continue
         try:
             full = fetch_ticket(t["id"])           # via/subject affidabili
             comments = get_ticket_comments(t["id"])
+        except Exception as e:
+            print(f"[WARN] ticket read fail {t.get('id')}: {e}")
+            continue
+        try:
+            if populate_order_number_if_missing(full, comments):
+                print(f"[OK] Order Number populated for ticket {t['id']}")
+        except Exception as e:
+            print(f"[WARN] order number fail {t.get('id')}: {e}")
+        try:
             origin = classify_origin(full, comments)
             tag_origin(full["id"], origin)
         except Exception as e:
@@ -1332,7 +1395,8 @@ def validate_env():
         "ZENDESK_EMAIL":Z_EMAIL,
         "ZENDESK_API_TOKEN":Z_API_TOKEN,
         "OPENAI_API_KEY":OPENAI_APIKEY,
-        "Z_TRACKING_FIELD":Z_TRACKING_FIELD
+        "Z_TRACKING_FIELD":Z_TRACKING_FIELD,
+        "Z_ORDER_FIELD":Z_ORDER_FIELD if Z_ORDER_FIELD.isdecimal() else ""
     }.items() if not v]
     if missing:
         raise SystemExit("Missing env vars: " + ", ".join(missing))
