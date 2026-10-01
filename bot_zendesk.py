@@ -423,8 +423,6 @@ def order_numbers_in_message(text: str) -> List[str]:
     text = text or ""
     found = [match.group(0) for match in ORDER_PAT.finditer(text)]
     found.extend(match.group(1) for match in LABELED_ORDER_PAT.finditer(text))
-    # A labelled Amazon order can also yield its first three digits; discard that fragment.
-    found = [value for value in found if not re.search(rf"\b{re.escape(value.lstrip('#'))}-\d", text)]
     return list(dict.fromkeys(found))
 
 def customer_order_number(comments: List[Dict[str, Any]], requester_id: int) -> Optional[str]:
