@@ -8,6 +8,7 @@ import requests
 from typing import List, Dict, Any, Optional
 from flask import Flask, jsonify
 from openai import OpenAI
+from openai_draft import POLICY_VERSION, generate_draft
 
 # ============ ENV ============
 Z_SUBDOMAIN   = os.getenv("ZENDESK_SUBDOMAIN", "").strip()
@@ -15,7 +16,14 @@ Z_EMAIL       = os.getenv("ZENDESK_EMAIL", "").strip()
 Z_API_TOKEN   = os.getenv("ZENDESK_API_TOKEN", "").strip()
 
 OPENAI_APIKEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # tenuto per eventuali futuri usi
+DRAFT_OPENAI_MODEL = "gpt-6.1-sol"
+DRAFT_REASONING_EFFORT = os.getenv("DRAFT_REASONING_EFFORT", "medium").strip()
+# Keep new AI drafts off until the separate version is tested and explicitly enabled.
+OPENAI_DRAFTS_ENABLED = os.getenv("OPENAI_DRAFTS_ENABLED", "false").strip().lower() == "true"
+IS_PULL_REQUEST = os.getenv("IS_PULL_REQUEST", "false").strip().lower() == "true"
+PILOT_PRIVATE_DRAFTS_ENABLED = os.getenv("PILOT_PRIVATE_DRAFTS_ENABLED", "false").strip().lower() == "true"
+PILOT_TICKET_IDS = os.getenv("PILOT_TICKET_IDS", "").strip()
+PILOT_DONE_TAG = "ai_private_draft_pilot_done"
 
 BRAND_NAME     = os.getenv("BRAND_NAME", "Divitize").strip()
 SIGNATURE_NAME = os.getenv("SIGNATURE_NAME", "Noe").strip()
@@ -65,7 +73,21 @@ def fetch_ticket(ticket_id: int) -> Dict[str, Any]:
     return z_get(f"/tickets/{ticket_id}.json").get("ticket", {})
 
 def get_ticket_comments(ticket_id: int) -> List[Dict[str, Any]]:
-    return z_get(f"/tickets/{ticket_id}/comments.json").get("comments", [])
+    comments: List[Dict[str, Any]] = []
+    cursor = None
+    while True:
+        params = {"page[size]": 100}
+        if cursor:
+            params["page[after]"] = cursor
+        page = z_get(f"/tickets/{ticket_id}/comments.json", params)
+        comments.extend(page.get("comments") or [])
+        meta = page.get("meta") or {}
+        if not meta.get("has_more"):
+            return comments
+        next_cursor = meta.get("after_cursor")
+        if not next_cursor or next_cursor == cursor:
+            raise RuntimeError(f"Zendesk comments pagination stalled for ticket {ticket_id}")
+        cursor = next_cursor
 
 def add_internal_note_and_tags(ticket_id: int, note: str, tags: List[str]):
     payload = {"ticket": {"comment": {"public": False, "body": note}, "additional_tags": tags}}
@@ -90,7 +112,8 @@ def ensure_tags(ticket_id: int, new_tags: List[str]):
     try:
         existing = get_ticket_tags(ticket_id)
         merged = sorted(set((existing or []) + (new_tags or [])))
-        z_put(f"/tickets/{ticket_id}.json", {"ticket": {"tags": merged}})
+        if set(existing) != set(merged):
+            z_put(f"/tickets/{ticket_id}.json", {"ticket": {"tags": merged}})
     except Exception as e:
         print(f"[WARN] ensure_tags failed on {ticket_id}: {e}")
 
@@ -512,11 +535,11 @@ def tag_origin(ticket_id: int, origin: str):
     else:
         ensure_tags(ticket_id, ["source_generic_email"])
 
-# ============ OPENAI (placeholder per futuri usi) ============
+# ============ OPENAI ============
 client = None
 try:
     if OPENAI_APIKEY:
-        client = OpenAI(api_key=OPENAI_APIKEY)
+        client = OpenAI(api_key=OPENAI_APIKEY, timeout=60, max_retries=1)
 except Exception as e:
     print(f"[WARN] OpenAI init failed: {e}")
     client = None
@@ -865,6 +888,18 @@ def current_sent_tracking_tag(tags: List[str]) -> Optional[str]:
             return t
     return None
 
+
+CREATOR_TRACKING_RE = re.compile(
+    r"\b(?:collab(?:oration|orate|orating)?|influencer|content creator|ugc|shoppable video|commission)\b",
+    re.I,
+)
+
+
+def is_creator_conversation(comments: List[Dict[str, Any]]) -> bool:
+    """Fail closed: a creator gift must not receive the customer-replacement template."""
+    return any(c.get("public") and CREATOR_TRACKING_RE.search(c.get("body") or "")
+               for c in comments)
+
 def extract_tracking_from_guard(tag: str) -> str:
     # guard è tracking_sent_<normalized>
     return tag[len(TRACKING_SENT_PREFIX):] if tag and tag.startswith(TRACKING_SENT_PREFIX) else ""
@@ -872,21 +907,22 @@ def extract_tracking_from_guard(tag: str) -> str:
 def normalize_tag(s: str) -> str:
     return re.sub(r'[^a-z0-9_]', '', (s or '').lower())
 
-def last_public_comment_contains_tracking(comments: List[Dict[str,Any]], tracking: str) -> bool:
-    if not comments: return False
+def last_public_comment_contains_tracking(comments: List[Dict[str,Any]], tracking: str,
+                                          requester_id: Optional[int] = None) -> bool:
+    """Check the latest *agent tracking announcement*, not a customer's quotation."""
+    if not comments:
+        return False
     key = normalize_tag(tracking)
     for c in reversed(comments):
-        if c.get("public"):
-            body = (c.get("body") or "")
-            if key in normalize_tag(body):
-                return True
-            if f"nums={normalize_tag(tracking)}" in normalize_tag(body):
-                return True
-            return False
+        if not c.get("public") or c.get("author_id") == requester_id:
+            continue
+        body = c.get("body") or ""
+        if "tracking number for your replacement" in body.lower():
+            return bool(key and key in normalize_tag(body))
     return False
 
 # ============ COMPOSIZIONE BOZZE ============
-def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
+def compose_legacy_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
     last = comments[-1]
     text = (last.get("body") or "").strip()
     requester_id = ticket.get("requester_id")
@@ -1058,6 +1094,84 @@ def compose_draft(ticket: Dict[str,Any], comments: List[Dict[str,Any]]) -> str:
 
     return "[Suggested reply by ChatGPT — please review and send]\n\n" + msg
 
+def draft_marker(comment_id: int) -> str:
+    return f"AI_DRAFT_FOR_CUSTOMER_COMMENT_ID={comment_id}"
+
+
+def draft_guard_tag(comment_id: int) -> str:
+    return f"ai_draft_comment_{comment_id}"
+
+
+def already_drafted_for_comment(comments: List[Dict[str, Any]], comment_id: int) -> bool:
+    marker = draft_marker(comment_id)
+    return any(not c.get("public") and marker in (c.get("body") or "") for c in comments)
+
+
+def compose_openai_draft(ticket: Dict[str, Any], comments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Generate a new reply from case context, never a canned-template fallback."""
+    public_comments = [c for c in comments if c.get("public")]
+    origin_hint = classify_origin(ticket, public_comments)
+    first_name = (extract_first_name_from_shopify_body(public_comments) if origin_hint == "shopify" else None)
+    first_name = first_name or get_user_first_name(ticket.get("requester_id"))
+    return generate_draft(client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT,
+                          ticket, comments, first_name, origin_hint)
+
+
+def format_internal_draft(customer_comment_id: int, result: Dict[str, Any]) -> str:
+    checks = result.get("facts_to_verify") or []
+    checks_text = "\n".join(f"- {item}" for item in checks) if checks else "- None identified"
+    return (
+        f"{draft_marker(customer_comment_id)}\n"
+        f"Policy: {POLICY_VERSION} | Route: {result['route']} | "
+        f"Human decision: {'yes' if result['needs_human_decision'] else 'no'}\n\n"
+        "PROPOSED CUSTOMER REPLY — review and send manually:\n"
+        f"{result['reply'].strip()}\n\n"
+        "AGENT NOTES — do not send:\n"
+        f"{result['agent_note'].strip()}\n"
+        f"Verify:\n{checks_text}"
+    )
+
+
+def post_internal_draft_once(ticket_id: int, customer_comment_id: int,
+                             result: Dict[str, Any], pilot: bool = False) -> bool:
+    """Recheck the ticket and atomically add one private draft for this customer message.
+
+    A Zendesk 409 conflict is intentionally allowed to bubble up; the next poll
+    re-reads comments before considering another write. An uncertain timeout is
+    handled the same way, so a successful-but-timed-out note is not repeated.
+    """
+    fresh_ticket = fetch_ticket(ticket_id)
+    fresh_comments = get_ticket_comments(ticket_id)
+    if fresh_ticket.get("status") in ("solved", "closed"):
+        return False
+    if draft_guard_tag(customer_comment_id) in (fresh_ticket.get("tags") or []):
+        return False
+    if pilot and PILOT_DONE_TAG in (fresh_ticket.get("tags") or []):
+        return False
+    if already_drafted_for_comment(fresh_comments, customer_comment_id):
+        return False
+    if not last_is_end_user_public(fresh_ticket, fresh_comments):
+        return False
+    if fresh_comments[-1].get("id") != customer_comment_id:
+        return False
+    # Honor drafts made by the old bot during the transition.
+    if DRAFT_TAG in (fresh_ticket.get("tags") or []) and not user_wrote_after_last_internal(
+            fresh_comments, fresh_ticket.get("requester_id")):
+        return False
+    updated_at = fresh_ticket.get("updated_at")
+    if not updated_at:
+        raise ValueError(f"Ticket {ticket_id} has no updated_at for a safe update")
+    payload = {"ticket": {
+        "comment": {"public": False, "body": format_internal_draft(customer_comment_id, result)},
+        "additional_tags": [DRAFT_TAG, draft_guard_tag(customer_comment_id)]
+                           + ([PILOT_DONE_TAG] if pilot else []),
+        "safe_update": True,
+        "updated_stamp": updated_at,
+    }}
+    z_put(f"/tickets/{ticket_id}.json", payload)
+    return True
+
+
 # ============ TRACKING: INVIO, CORREZIONE, ANTI-SPAM ============
 def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
     """
@@ -1073,62 +1187,83 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
     Ritorna True se ha pubblicato o retro-taggato; False se non ha fatto nulla.
     """
     ticket_id = ticket["id"]
+    # The caller's snapshot can be stale after another poll or agent action.
+    ticket = fetch_ticket(ticket_id)
+    if ticket.get("status") == "closed":
+        return False
     requester_id = ticket.get("requester_id")
-    first_name = get_user_first_name(requester_id)
     tags = ticket.get("tags") or []
     current_tracking = get_custom_field_value(ticket, Z_TRACKING_FIELD) if Z_TRACKING_FIELD else None
     if not current_tracking:
         return False
 
     current_guard = TRACKING_SENT_PREFIX + normalize_tag(current_tracking)
-    existing_guard = current_sent_tracking_tag(tags)  # es. tracking_sent_uk4246...
-
-    comments = get_ticket_comments(ticket_id)
-
-    # Caso: esiste già un guard ma è DIVERSO -> correzione tracking
-    if existing_guard and existing_guard != current_guard:
-        # Se abbiamo già inviato questa correzione (cioè il nuovo guard è presente), non ripetere
-        if current_guard in tags or last_public_comment_contains_tracking(comments, current_tracking):
-            ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-            remove_tags(ticket_id, [existing_guard])
-            print(f"[OK] Tracking correction retro-tagged on ticket {ticket_id}")
-            try:
-                z_put(f"/tickets/{ticket_id}.json", {"ticket": {"status": "solved"}})
-            except Exception:
-                pass
-            return True
-
-        # Invia messaggio di correzione
-        body = build_public_tracking_correction_message(current_tracking, first_name)
-        add_public_reply_and_tags(ticket_id, body, [TAG_REPLACEMENT_SENT, current_guard], set_status="solved")
-        ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-        remove_tags(ticket_id, [existing_guard])
-        print(f"[OK] Tracking CORRECTED and solved for ticket {ticket_id}")
-        return True
-
-    # Caso: esiste guard uguale → già inviato, non fare nulla
-    if existing_guard == current_guard:
+    old_guards = [tag for tag in tags if tag.startswith(TRACKING_SENT_PREFIX)]
+    if current_guard in old_guards and len(old_guards) == 1 and ticket.get("status") == "solved":
         return False
 
-    # Caso: nessun guard presente -> prima comunicazione
-    if last_public_comment_contains_tracking(comments, current_tracking):
-        ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-        try:
-            z_put(f"/tickets/{ticket_id}.json", {"ticket": {"status": "solved"}})
-        except Exception:
-            pass
-        print(f"[OK] Retro-tag guard + replacement_sent on ticket {ticket_id}")
-        return True
+    comments = get_ticket_comments(ticket_id)
+    if is_creator_conversation(comments):
+        print(f"[INFO] Creator ticket {ticket_id}: tracking requires human handling")
+        return False
 
-    # invio standard
-    body = build_public_tracking_message(current_tracking, first_name)
-    add_public_reply_and_tags(ticket_id, body, [TAG_REPLACEMENT_SENT, current_guard], set_status="solved")
-    ensure_tags(ticket_id, [TAG_REPLACEMENT_SENT, current_guard])
-    print(f"[OK] Tracking published + solved + tags forced for ticket {ticket_id}")
+    already_announced = current_guard in old_guards or last_public_comment_contains_tracking(
+        comments, current_tracking, requester_id)
+    updated_at = ticket.get("updated_at")
+    if not updated_at:
+        raise ValueError(f"Ticket {ticket_id} has no updated_at for a safe update")
+    new_tags = sorted((set(tags) - set(old_guards)) | {TAG_REPLACEMENT_SENT, current_guard})
+    update: Dict[str, Any] = {
+        "tags": new_tags, "status": "solved", "safe_update": True,
+        "updated_stamp": updated_at,
+    }
+    if not already_announced:
+        first_name = get_user_first_name(requester_id)
+        body = (build_public_tracking_correction_message(current_tracking, first_name)
+                if old_guards else build_public_tracking_message(current_tracking, first_name))
+        update["comment"] = {"public": True, "body": body}
+    # Comment, guard tag and solved status are one protected Zendesk update.
+    # On a 409/timeout, the next poll re-reads the ticket before deciding again.
+    z_put(f"/tickets/{ticket_id}.json", {"ticket": update})
+    print(f"[OK] Tracking {'reconciled' if already_announced else 'published'} for ticket {ticket_id}")
     return True
 
 # ============ CICLO PRINCIPALE ============
+def pilot_ticket_ids() -> List[int]:
+    """Allow at most three explicit tickets; a bad configuration makes no writes."""
+    parts = [part.strip() for part in PILOT_TICKET_IDS.split(",") if part.strip()]
+    if not parts or len(parts) > 3 or any(not part.isdecimal() for part in parts):
+        return []
+    ids = [int(part) for part in parts]
+    return ids if len(set(ids)) == len(ids) else []
+
+
+def process_private_draft_pilot_once():
+    """PR previews never send tracking, tag origins, or touch other tickets."""
+    if not PILOT_PRIVATE_DRAFTS_ENABLED:
+        return
+    for ticket_id in pilot_ticket_ids():
+        try:
+            ticket = fetch_ticket(ticket_id)
+            if ticket.get("status") in ("solved", "closed") or PILOT_DONE_TAG in (ticket.get("tags") or []):
+                continue
+            comments = get_ticket_comments(ticket_id)
+            if not comments or not last_is_end_user_public(ticket, comments):
+                continue
+            customer_comment_id = comments[-1].get("id")
+            if customer_comment_id is None or already_drafted_for_comment(comments, customer_comment_id):
+                continue
+            result = compose_openai_draft(ticket, comments)
+            if post_internal_draft_once(ticket_id, customer_comment_id, result, pilot=True):
+                print(f"[OK] Private pilot draft created for ticket {ticket_id}")
+        except Exception as e:
+            print(f"[ERROR private pilot] {ticket_id}: {e}")
+
+
 def process_once():
+    if IS_PULL_REQUEST:
+        process_private_draft_pilot_once()
+        return
     # 0) Tagga origine (Shopify / Amazon QR / generic) su tutti i ticket non-closed
     for t in list_recent_tickets():
         if t.get("status") == "closed":
@@ -1151,7 +1286,11 @@ def process_once():
         except Exception as e:
             print(f"[ERROR tracking] {t.get('id')}: {e}")
 
-    # 2) Bozze interne (risposte) solo quando serve
+    # 2) AI drafts are opt-in; the existing public tracking path above is unchanged.
+    if not OPENAI_DRAFTS_ENABLED:
+        return
+
+    # 3) Bozze interne (risposte) solo quando serve
     for t in list_recent_tickets():
         ticket_id = t["id"]
         status = t.get("status")
@@ -1177,9 +1316,12 @@ def process_once():
 
         try:
             full = fetch_ticket(ticket_id)
-            draft = compose_draft(full, comments)
-            add_internal_note_and_tags(ticket_id, draft, [DRAFT_TAG])
-            print(f"[OK] Draft created for ticket {ticket_id}")
+            customer_comment_id = comments[-1].get("id")
+            if customer_comment_id is None or already_drafted_for_comment(comments, customer_comment_id):
+                continue
+            result = compose_openai_draft(full, comments)
+            if post_internal_draft_once(ticket_id, customer_comment_id, result):
+                print(f"[OK] AI draft created for ticket {ticket_id}, comment {customer_comment_id}")
         except Exception as e:
             print(f"[ERROR draft] {ticket_id}: {e}")
 
