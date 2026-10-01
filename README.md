@@ -1,7 +1,6 @@
-# Divitize Zendesk bot — working copy, not deployed
+# Divitize Zendesk bot
 
-This copy starts from the exact `bot_zendesk.py` deployed from GitHub commit
-`13c10a77807f1f3b5e8892448295e0ef974cb1da`. The new OpenAI path is in
+The OpenAI path is in
 `openai_draft.py` and is called by `compose_openai_draft` in `bot_zendesk.py`.
 
 The wording of the existing first/corrected public tracking messages is unchanged.
@@ -12,12 +11,22 @@ Ordinary AI replies are private Zendesk notes for an agent to review and send.
 The old keyword-template function remains in the file as `compose_legacy_draft`
 for comparison, but is not called.
 
+The bot fills Zendesk's **Order Number** ticket field when it is empty and a
+public requester comment contains one recognizable order number. It supports
+Amazon's `123-1234567-1234567` format (including the contact form's
+`Your123-...` placeholder) and explicit `order #1234`, `order number: 1234`,
+or `order ID is 1234` wording. Ambiguous messages are skipped; an existing
+field is never overwritten. The update contains no comment, status, or tag,
+uses Zendesk's safe update, and rechecks the ticket before writing.
+
 New settings:
 
 - `OPENAI_DRAFTS_ENABLED=true` enables the AI draft path. It defaults to `false`.
 - Draft generation is locked to `gpt-6.1-sol`; `DRAFT_OPENAI_MODEL` environment overrides are ignored. `gpt-6-astra` is blocked by the draft module as an additional safeguard.
 - `DRAFT_REASONING_EFFORT` defaults to `medium`.
 - `OPENAI_API_KEY` is still required by the existing service configuration.
+- `Z_ORDER_FIELD` defaults to Divitize's Order Number field ID
+  `29113177850258`. No additional Render setting is required.
 
 Private-draft trial on a Render pull-request preview:
 
@@ -31,10 +40,8 @@ Private-draft trial on a Render pull-request preview:
   free-instance hours. Never enable the pilot variables on the production
   service as a substitute for a preview.
 
-Before enabling this on Render: verify model access and spending limits, test
-draft quality on historical tickets, and make sure only one bot instance is
-running. The safeguards have offline tests, but they have not been tested
-against live Zendesk behavior. This review branch has not been deployed or
-used to write to Zendesk.
+Production runs on a Render Free web service, which can sleep after inactivity.
+Polling (including order-field updates and tracking) happens only while the
+service is awake. Keep only one bot instance running to avoid competing writes.
 
 Offline tests: `python3 -m unittest -v test_ai_draft.py`.
