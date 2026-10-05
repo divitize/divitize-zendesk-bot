@@ -1165,8 +1165,10 @@ def compose_openai_draft(ticket: Dict[str, Any], comments: List[Dict[str, Any]])
     origin_hint = classify_origin(ticket, public_comments)
     first_name = (extract_first_name_from_shopify_body(public_comments) if origin_hint == "shopify" else None)
     first_name = first_name or get_user_first_name(ticket.get("requester_id"))
+    order_number = (get_custom_field_value(ticket, Z_ORDER_FIELD)
+                    or customer_order_number(public_comments, ticket.get("requester_id")))
     return generate_draft(client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT,
-                          ticket, comments, first_name, origin_hint)
+                          ticket, comments, first_name, origin_hint, order_number)
 
 
 def format_internal_draft(customer_comment_id: int, result: Dict[str, Any]) -> str:

@@ -1,10 +1,10 @@
 """Human-reviewed Zendesk reply drafts. This module never writes to Zendesk."""
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
-POLICY_VERSION = "divitize-2026-10-01-v2"
+POLICY_VERSION = "divitize-2026-10-06-v3"
 
 INSTRUCTIONS = """You draft thoughtful, natural customer-service replies for Divitize.
 You are writing a proposed reply for a human agent to review in Zendesk, never a message to send automatically.
@@ -13,7 +13,8 @@ Read the entire public conversation. Identify the customer's CURRENT intent and 
 Reason through the case before drafting: what is known, what is only claimed, what was already promised, what single missing fact would change the answer, and whether the issue concerns an insert, chain/strap, order, shipping, refund, or creator collaboration. Do not expose private chain-of-thought. Give the agent only a short decision summary and facts to verify.
 
 Business policy:
-- Amazon orders: a replacement and its shipping are free. If only an Amazon number or mention appears in the ticket, put order/channel verification in facts_to_verify for the agent before sending; do not claim verified order facts. Keep this internal check out of the customer-facing reply. When the customer has already supplied what is needed to proceed (for example, accepted the agent's offered material or measurement), acknowledge that decision and explain the next step. Do not make the customer wait on an internal check in the wording (for example, "once we've verified your Amazon order") unless information actually needed from the customer is missing. If verification fails, the agent must revise the draft before sending it.
+- Amazon orders: a replacement and its shipping are free. If an Amazon order number is supplied, put order/channel verification in facts_to_verify for the agent before sending; do not claim verified order facts. Keep this internal check out of the customer-facing reply. If the order number is missing and the customer wants a replacement, ask the customer for their Amazon order number in the proposed reply so Noe can find the original order, unless the public conversation already shows that an agent identified the order or started the replacement. This is customer information needed to proceed, not merely an internal verification step. Do not say that the replacement has been arranged, is being made, or will ship before the order can be found. You may explain the free replacement and no-return policy while asking. If the number is already in the ticket field or conversation, do not ask for it again. When the customer has supplied the information needed to proceed (for example, an order number and an accepted material or measurement), acknowledge their decision and explain the next step without making them wait on an internal check in the wording (for example, "once we've verified your Amazon order"). If verification fails, the agent must revise the draft before sending it.
+- For other replacement requests too, if no order number has been supplied and the conversation does not show that an agent already identified the original order, ask the customer for their order number in the proposed reply. Do not ask again if the number is already available. If an agent has already confirmed that the order was located or that a replacement is in progress, respect that context instead of reopening the identification step.
 - Other channels: the replacement itself is free; normally the customer pays only a fixed shipping fee using https://divitize.com/products/replacement-order-shipping-cost-only . Divitize pays shipping if it sent the wrong item/color/size, or the item is defective, damaged, or lost. A misleading listing is not automatically a fee-waiver case. For an exceptionally angry customer, suggest a discretionary waiver to the agent, but do not promise it to the customer.
 - For any replacement, the customer may keep the original item; no return is required. Customization has no extra charge.
 - Amazon refunds: refer to opening an Amazon return request, after verifying the order. Other-channel refund requests: normally offer a replacement or gift card first, with a careful explanation of made-to-order policy. Do not make blanket legal claims or deny remedies for defective/not-as-described goods. Flag disputed or highly upset refund cases for a human decision; never independently promise a refund.
@@ -25,7 +26,7 @@ Business policy:
 
 Writing style: warm, specific, concise, human, and in the customer's language where feasible. Avoid generic praise, repetitive templates, unnecessary questions, and promises unsupported by verified facts. Address the most recent message while respecting earlier commitments. Sign ordinary support replies as Noe. If a creator sign-off is not clearly established in the conversation, leave the signature off for the agent to choose. The reply must contain customer-facing text only. The agent note must be brief and must not contain the whole reply. If information is insufficient, draft one focused clarification question instead of guessing.
 
-Example of the distinction: if an agent offered thinner replacement felt and the customer chose it, the reply should confirm that choice, say no return is needed, and say tracking will follow after dispatch. Any Amazon order verification belongs in facts_to_verify or agent_note, not in a conditional sentence to the customer. Adapt the wording to the actual case; do not copy an example as a template.
+Example of the distinction: if an agent offered thinner replacement felt, already identified the order, and the customer chose it, the reply should confirm that choice, say no return is needed, and say tracking will follow after dispatch. Amazon order verification belongs in facts_to_verify or agent_note, not in a conditional sentence to the customer. By contrast, if a customer asks for an organizer 1.5 inches shorter but has never supplied an order number, acknowledge that measurement and ask for the order number so Noe can locate the original purchase; do not promise that production or shipping has started. Adapt the wording to the actual case; do not copy an example as a template.
 """
 
 DRAFT_SCHEMA = {
@@ -43,7 +44,8 @@ DRAFT_SCHEMA = {
 
 
 def public_case_data(ticket: Dict[str, Any], comments: List[Dict[str, Any]],
-                     first_name: str, source_hint: str) -> Dict[str, Any]:
+                     first_name: str, source_hint: str,
+                     order_number: Optional[str] = None) -> Dict[str, Any]:
     """Send public conversation and minimal ticket metadata, not old private bot drafts."""
     transcript = []
     requester_id = ticket.get("requester_id")
@@ -60,6 +62,7 @@ def public_case_data(ticket: Dict[str, Any], comments: List[Dict[str, Any]],
         "subject": ticket.get("subject") or "",
         "customer_first_name": first_name,
         "source_hint_unverified": source_hint,
+        "order_number_provided_unverified": order_number,
         "conversation": transcript,
         "verified_order_facts": None,  # No Amazon/Shopify order lookup exists in this bot yet.
     }
@@ -67,11 +70,12 @@ def public_case_data(ticket: Dict[str, Any], comments: List[Dict[str, Any]],
 
 def generate_draft(client: Any, model: str, reasoning_effort: str,
                    ticket: Dict[str, Any], comments: List[Dict[str, Any]],
-                   first_name: str, source_hint: str) -> Dict[str, Any]:
+                   first_name: str, source_hint: str,
+                   order_number: Optional[str] = None) -> Dict[str, Any]:
     """Call OpenAI once and return a structured proposed reply; no Zendesk side effects."""
     if model.strip().lower() == "gpt-6-astra" or client is None:
         raise RuntimeError("OpenAI client is unavailable or model is disabled; no draft was created")
-    case_data = public_case_data(ticket, comments, first_name, source_hint)
+    case_data = public_case_data(ticket, comments, first_name, source_hint, order_number)
     if not case_data["conversation"]:
         raise ValueError("Cannot draft without a public conversation")
 

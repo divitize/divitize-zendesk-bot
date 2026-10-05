@@ -154,19 +154,58 @@ class AIDraftTests(unittest.TestCase):
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
         case = json.loads(request["input"])
         self.assertEqual(case["source_hint_unverified"], "amazon_qr")
+        self.assertIsNone(case["order_number_provided_unverified"])
         self.assertIsNone(case["verified_order_facts"])
         self.assertEqual(len(case["conversation"]), 1)
         self.assertEqual(case["conversation"][0]["comment_id"], 71)
 
-    def test_prompt_keeps_internal_order_checks_out_of_customer_reply(self):
+    def test_prompt_asks_customer_for_missing_order_id_but_keeps_verification_internal(self):
         client = FakeClient(RESULT)
         generate_draft(client, "gpt-6.1-sol", "medium", TICKET,
                        [CUSTOMER], "Maya", "amazon_qr")
         instructions = client.calls[0]["instructions"]
         self.assertIn("put order/channel verification in facts_to_verify", instructions)
         self.assertIn("Keep this internal check out of the customer-facing reply", instructions)
+        self.assertIn("ask the customer for their Amazon order number in the proposed reply", instructions)
+        self.assertIn("do not ask for it again", instructions)
         self.assertIn("tracking details will follow when the replacement ships", instructions)
         self.assertIn("Do not claim that a tracking number already exists", instructions)
+
+    def test_order_number_field_is_passed_to_draft_without_claiming_verification(self):
+        ticket = {**TICKET, "custom_fields": [{"id": "29113177850258",
+                                                "value": "113-4771136-5412247"}]}
+        with (patch.object(bot, "client", FakeClient(RESULT)),
+              patch.object(bot, "get_user_first_name", return_value="Stella")):
+            bot.compose_openai_draft(ticket, [CUSTOMER])
+            request = bot.client.calls[0]
+        case = json.loads(request["input"])
+        self.assertEqual(case["order_number_provided_unverified"], "113-4771136-5412247")
+        self.assertIsNone(case["verified_order_facts"])
+
+    def test_customer_order_number_is_available_before_field_is_filled(self):
+        customer = {**CUSTOMER, "body": "My Amazon order is 113-4771136-5412247."}
+        with (patch.object(bot, "client", FakeClient(RESULT)),
+              patch.object(bot, "get_user_first_name", return_value="Stella")):
+            bot.compose_openai_draft(TICKET, [customer])
+            request = bot.client.calls[0]
+        self.assertEqual(json.loads(request["input"])["order_number_provided_unverified"],
+                         "113-4771136-5412247")
+
+    def test_ticket_707_style_request_exposes_missing_order_id_to_model(self):
+        ticket = {**TICKET, "subject": "Free replacement", "custom_fields": []}
+        customer = {**CUSTOMER, "body": (
+            "Hi...the organizer I purchased from Amazon is nice, but I need the height "
+            "to be 1.5 inches shorter. Thank you so much. Stella Fowlkes")}
+        thanks = {**CUSTOMER, "id": 72, "body": "Ok...thank you"}
+        with (patch.object(bot, "client", FakeClient(RESULT)),
+              patch.object(bot, "get_user_first_name", return_value="Stella")):
+            bot.compose_openai_draft(ticket, [customer, thanks])
+            request = bot.client.calls[0]
+        case = json.loads(request["input"])
+        self.assertIsNone(case["order_number_provided_unverified"])
+        self.assertEqual(len(case["conversation"]), 2)
+        self.assertIn("1.5 inches shorter", case["conversation"][0]["body"])
+        self.assertIn("ask the customer for their Amazon order number", request["instructions"])
 
     def test_creator_route_always_requires_human_decision(self):
         client = FakeClient({**RESULT, "route": "creator"})
