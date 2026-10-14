@@ -61,6 +61,10 @@ class AIDraftTests(unittest.TestCase):
         cases = [
             ("Amazon Order Number: [Your112-5428578-9415428]", ["112-5428578-9415428"]),
             ("Amazon order number: 113-4771136-5412247", ["113-4771136-5412247"]),
+            ("The Amazon order number is 114-7748319-\n9746607. Thanks very much.",
+             ["114-7748319-9746607"]),
+            ("Amazon order: 114-7748319-\r\n 9746607", ["114-7748319-9746607"]),
+            ("Amazon order: 114-7748319-\n\n9746607", []),
             ("My order #1234 arrived yesterday", ["#1234"]),
             ("Order number: 23456", ["23456"]),
             ("Order ID is 34567", ["34567"]),
@@ -70,6 +74,12 @@ class AIDraftTests(unittest.TestCase):
         for message, expected in cases:
             with self.subTest(message=message):
                 self.assertEqual(bot.order_numbers_in_message(message), expected)
+
+    def test_wrapped_amazon_order_is_normalized_for_draft_and_origin(self):
+        message = "The Amazon order number is 114-7748319-\n9746607."
+        self.assertEqual(bot.extract_order_number(message), "114-7748319-9746607")
+        customer = {**CUSTOMER, "body": message}
+        self.assertEqual(bot.classify_origin(TICKET, [customer]), "amazon_qr")
 
     def test_order_number_only_from_customer_public_comments(self):
         agent = {"id": 72, "author_id": 99, "public": True, "body": "Order #9999"}
@@ -97,6 +107,20 @@ class AIDraftTests(unittest.TestCase):
                                                       "value": "113-4771136-5412247"}])
         self.assertTrue(payload["safe_update"])
         self.assertEqual(payload["updated_stamp"], ticket["updated_at"])
+        self.assertNotIn("comment", payload)
+        self.assertNotIn("status", payload)
+        self.assertNotIn("tags", payload)
+
+    def test_wrapped_amazon_order_fills_only_order_field(self):
+        ticket = {**TICKET, "custom_fields": [{"id": "29113177850258", "value": None}]}
+        customer = {**CUSTOMER, "body": "The Amazon order number is 114-7748319-\n9746607."}
+        with (patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[customer]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.populate_order_number_if_missing(ticket, [customer]))
+        payload = put.call_args.args[1]["ticket"]
+        self.assertEqual(payload["custom_fields"], [{"id": 29113177850258,
+                                                     "value": "114-7748319-9746607"}])
         self.assertNotIn("comment", payload)
         self.assertNotIn("status", payload)
         self.assertNotIn("tags", payload)
