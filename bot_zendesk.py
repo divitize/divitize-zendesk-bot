@@ -148,9 +148,10 @@ def get_custom_field_value(ticket: Dict[str, Any], field_id: str) -> Optional[st
     return None
 
 # ============ HEURISTICHE DI TESTO ============
-# Amazon order, including a line wrap immediately after a hyphen in an email.
+# Amazon order, including one or two line breaks immediately after a hyphen
+# in an email (Zendesk ticket #736 has two).
 # Keep the three digit groups exact; the captured groups become the canonical value.
-ORDER_PAT = re.compile(r"(?<!\d)(\d{3})-[ \t]*(?:\r?\n[ \t]*)?(\d{7})-[ \t]*(?:\r?\n[ \t]*)?(\d{7})\b")
+ORDER_PAT = re.compile(r"(?<!\d)(\d{3})-[ \t]*(?:\r?\n[ \t]*){0,2}(\d{7})-[ \t]*(?:\r?\n[ \t]*){0,2}(\d{7})\b")
 # Other channels: require an explicit order label, never an unlabelled number.
 LABELED_ORDER_PAT = re.compile(
     r"\border\s*(?:number|no\.?|id)?\s*(?::|=|\bis\b)?\s*(#?\d{3,9})\b(?!-\d)",
