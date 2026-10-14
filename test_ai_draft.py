@@ -64,7 +64,8 @@ class AIDraftTests(unittest.TestCase):
             ("The Amazon order number is 114-7748319-\n9746607. Thanks very much.",
              ["114-7748319-9746607"]),
             ("Amazon order: 114-7748319-\r\n 9746607", ["114-7748319-9746607"]),
-            ("Amazon order: 114-7748319-\n\n9746607", []),
+            ("Amazon order: 114-7748319-\n\n9746607", ["114-7748319-9746607"]),
+            ("Amazon order: 114-7748319-\n\n\n9746607", []),
             ("My order #1234 arrived yesterday", ["#1234"]),
             ("Order number: 23456", ["23456"]),
             ("Order ID is 34567", ["34567"]),
@@ -76,7 +77,7 @@ class AIDraftTests(unittest.TestCase):
                 self.assertEqual(bot.order_numbers_in_message(message), expected)
 
     def test_wrapped_amazon_order_is_normalized_for_draft_and_origin(self):
-        message = "The Amazon order number is 114-7748319-\n9746607."
+        message = "The Amazon order number is 114-7748319-\n\n9746607."
         self.assertEqual(bot.extract_order_number(message), "114-7748319-9746607")
         customer = {**CUSTOMER, "body": message}
         self.assertEqual(bot.classify_origin(TICKET, [customer]), "amazon_qr")
@@ -113,7 +114,7 @@ class AIDraftTests(unittest.TestCase):
 
     def test_wrapped_amazon_order_fills_only_order_field(self):
         ticket = {**TICKET, "custom_fields": [{"id": "29113177850258", "value": None}]}
-        customer = {**CUSTOMER, "body": "The Amazon order number is 114-7748319-\n9746607."}
+        customer = {**CUSTOMER, "body": "The Amazon order number is 114-7748319-\n\n9746607."}
         with (patch.object(bot, "fetch_ticket", return_value=ticket),
               patch.object(bot, "get_ticket_comments", return_value=[customer]),
               patch.object(bot, "z_put") as put):
