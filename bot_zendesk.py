@@ -148,7 +148,9 @@ def get_custom_field_value(ticket: Dict[str, Any], field_id: str) -> Optional[st
     return None
 
 # ============ HEURISTICHE DI TESTO ============
-ORDER_PAT = re.compile(r"(?<!\d)\d{3}-\d{7}-\d{7}\b")  # Amazon order (also inside form placeholder "Your112-...")
+# Amazon order, including a line wrap immediately after a hyphen in an email.
+# Keep the three digit groups exact; the captured groups become the canonical value.
+ORDER_PAT = re.compile(r"(?<!\d)(\d{3})-[ \t]*(?:\r?\n[ \t]*)?(\d{7})-[ \t]*(?:\r?\n[ \t]*)?(\d{7})\b")
 # Other channels: require an explicit order label, never an unlabelled number.
 LABELED_ORDER_PAT = re.compile(
     r"\border\s*(?:number|no\.?|id)?\s*(?::|=|\bis\b)?\s*(#?\d{3,9})\b(?!-\d)",
@@ -415,13 +417,13 @@ def is_pure_thanks(text: str) -> bool:
 
 def extract_order_number(text: str) -> Optional[str]:
     if not text: return None
-    m = ORDER_PAT.search(text.replace("\n"," "))
-    return m.group(0) if m else None
+    m = ORDER_PAT.search(text)
+    return "-".join(m.groups()) if m else None
 
 def order_numbers_in_message(text: str) -> List[str]:
     """Return distinct recognizable order numbers in one customer message."""
     text = text or ""
-    found = [match.group(0) for match in ORDER_PAT.finditer(text)]
+    found = ["-".join(match.groups()) for match in ORDER_PAT.finditer(text)]
     found.extend(match.group(1) for match in LABELED_ORDER_PAT.finditer(text))
     return list(dict.fromkeys(found))
 
@@ -574,7 +576,7 @@ def classify_origin(ticket: Dict[str, Any], comments: List[Dict[str, Any]]) -> s
 
     if any(tok in subject for tok in AMAZON_SUBJECT_TOKENS):
         return "amazon_qr"
-    if ORDER_PAT.search(thread_text.replace("\n", " ")):
+    if ORDER_PAT.search(thread_text):
         return "amazon_qr"
 
     return "generic_email"
