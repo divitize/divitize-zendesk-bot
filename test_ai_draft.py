@@ -34,6 +34,7 @@ import bot_zendesk as bot
 from openai_draft import generate_draft
 from collaboration_draft import generate_collaboration_draft, HANDLED_PREFIX
 from social_profiles import customer_social_profiles
+from order_numbers import order_number_validation, malformed_amazon_numbers
 
 
 TICKET = {"id": 42, "requester_id": 5, "subject": "Bag insert", "status": "open",
@@ -951,6 +952,142 @@ class SocialProfileTests(unittest.TestCase):
 
     def test_removed_other_social_field_is_not_read_or_written(self):
         self.assertNotIn("other_social_profiles", bot.COLLAB_CONTEXT_FIELDS)
+
+
+class OrderValidationTests(unittest.TestCase):
+    def malformed(self):
+        return {**CUSTOMER, "body": "Amazon Order Number: 113-8325661-346022\n"
+                "The insert is much too small; can I get a replacement?"}
+
+    def legacy_comments(self):
+        note = bot.format_internal_draft(71, RESULT).replace(
+            bot.POLICY_VERSION, "divitize-2026-10-15-v4")
+        return [self.malformed(), {"id": 72, "author_id": 99, "public": False, "body": note}]
+
+    def test_ticket_752_number_is_malformed_not_usable(self):
+        c = self.malformed()
+        self.assertEqual(malformed_amazon_numbers(c["body"]), ["113-8325661-346022"])
+        self.assertEqual(bot.order_numbers_in_message(c["body"]), [])
+        state = order_number_validation([c], 5)
+        self.assertEqual(state["status"], "malformed_amazon")
+        self.assertTrue(state["requires_customer_correction"])
+        self.assertIsNone(state["number"])
+
+    def test_malformed_variants_do_not_leak_partial_valid_numbers(self):
+        for number in ("113-8325661-346022", "113-8325661-34602288",
+                       "113-832566-3460228", "1113-8325661-3460228",
+                       "113 -8325661-346022"):
+            with self.subTest(number=number):
+                self.assertEqual(bot.order_numbers_in_message("Amazon Order Number: " + number), [])
+
+    def test_malformed_order_does_not_populate_field(self):
+        with patch.object(bot, "fetch_ticket") as fetch, patch.object(bot, "z_put") as put:
+            self.assertFalse(bot.populate_order_number_if_missing(TICKET, [self.malformed()]))
+        fetch.assert_not_called()
+        put.assert_not_called()
+
+    def test_latest_typo_does_not_fall_back_to_an_older_order(self):
+        old = {**CUSTOMER, "id": 70, "body": "Amazon order: 113-8325661-3460228"}
+        self.assertIsNone(bot.customer_order_number([old, self.malformed()], 5))
+
+    def test_corrected_number_supersedes_old_typo(self):
+        corrected = {**CUSTOMER, "id": 73, "body": "Sorry, the full number is 113-8325661-3460228"}
+        comments = [self.malformed(), corrected]
+        self.assertEqual(bot.customer_order_number(comments, 5), "113-8325661-3460228")
+        state = order_number_validation(comments, 5)
+        self.assertEqual(state["status"], "provided_unverified")
+        self.assertFalse(state["requires_customer_correction"])
+
+    def test_only_public_requester_data_can_raise_customer_typo_flag(self):
+        c = self.malformed()
+        for ignored in ({**c, "author_id": 99}, {**c, "public": False}):
+            self.assertEqual(order_number_validation([ignored], 5)["status"], "missing")
+
+    def test_generic_order_and_valid_known_field_are_not_malformed(self):
+        self.assertEqual(order_number_validation([{**CUSTOMER, "body": "Order #1234"}], 5)["status"],
+                         "provided_unverified")
+        self.assertFalse(order_number_validation([self.malformed()], 5, "113-8325661-3460228")
+                         ["requires_customer_correction"])
+
+    def test_invalid_manual_field_is_flagged_for_draft_but_not_rewritten(self):
+        state = order_number_validation([CUSTOMER], 5, "113-8325661-346022")
+        self.assertEqual(state["status"], "malformed_amazon")
+        client = FakeClient(RESULT)
+        generate_draft(client, "gpt-6.1-sol", "medium", TICKET, [CUSTOMER], "Kym",
+                       "amazon_qr", "113-8325661-346022")
+        self.assertIsNone(json.loads(client.calls[0]["input"])["order_number_provided_unverified"])
+
+    def test_model_receives_validation_and_customer_facing_correction_instruction(self):
+        client = FakeClient(RESULT)
+        generate_draft(client, "gpt-6.1-sol", "medium", TICKET, [self.malformed()], "Kym", "amazon_qr")
+        case = json.loads(client.calls[0]["input"])
+        self.assertEqual(case["order_number_validation"]["status"], "malformed_amazon")
+        self.assertIsNone(case["order_number_provided_unverified"])
+        self.assertIsNone(case["verified_order_facts"])
+        instructions = client.calls[0]["instructions"]
+        self.assertIn("CUSTOMER-FACING reply", instructions)
+        self.assertIn("Never guess a missing digit", instructions)
+        self.assertIn("do not thank them as if a usable number was received", instructions)
+
+    def test_ambiguous_complete_numbers_are_explicit_to_model(self):
+        state = order_number_validation([{**CUSTOMER, "body": "Order #1234 or order #5678"}], 5)
+        self.assertEqual(state["status"], "ambiguous")
+        self.assertTrue(state["requires_customer_correction"])
+
+    def test_unsent_legacy_draft_gets_one_atomic_private_correction(self):
+        comments = self.legacy_comments()
+        with (patch.object(bot, "compose_openai_draft", return_value=RESULT),
+              patch.object(bot, "fetch_ticket", return_value=TICKET),
+              patch.object(bot, "get_ticket_comments", return_value=comments),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.repair_order_validation_draft_once(TICKET, comments))
+        update = put.call_args.args[1]["ticket"]
+        self.assertEqual(set(update), {"comment", "additional_tags", "safe_update", "updated_stamp"})
+        self.assertFalse(update["comment"]["public"])
+        self.assertIn("supersedes the earlier UNSENT", update["comment"]["body"])
+        self.assertIn(bot.POLICY_VERSION, update["comment"]["body"])
+        self.assertIn("ai_order_validation_repair_71", update["additional_tags"])
+        self.assertTrue(update["safe_update"])
+
+    def test_repair_timeout_after_save_cannot_repeat(self):
+        comments = self.legacy_comments()
+        ticket = {**TICKET, "tags": []}
+        def save_then_timeout(_path, data):
+            ticket["tags"].extend(data["ticket"]["additional_tags"])
+            comments.append({"id": 73, **data["ticket"]["comment"]})
+            raise TimeoutError()
+        with (patch.object(bot, "compose_openai_draft", return_value=RESULT) as generate,
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=comments),
+              patch.object(bot, "z_put", side_effect=save_then_timeout) as put):
+            with self.assertRaises(TimeoutError):
+                bot.repair_order_validation_draft_once(ticket, comments)
+            self.assertFalse(bot.repair_order_validation_draft_once(ticket, comments))
+        put.assert_called_once()
+        generate.assert_called_once()
+
+    def test_repair_does_not_override_human_reply_note_new_data_or_closed_ticket(self):
+        comments = self.legacy_comments()
+        cases = [
+            (TICKET, comments + [{"id": 73, "public": True, "author_id": 99, "body": "Sent reply"}]),
+            (TICKET, comments + [{"id": 73, "public": False, "body": "Human note"}]),
+            ({**TICKET, "status": "solved"}, comments),
+            ({**TICKET, "status": "closed"}, comments),
+            ({**TICKET, "custom_fields": [{"id": bot.Z_ORDER_FIELD, "value": "113-8325661-3460228"}]}, comments),
+        ]
+        for fresh, fresh_comments in cases:
+            with (self.subTest(fresh=fresh, fresh_comments=fresh_comments),
+                  patch.object(bot, "compose_openai_draft", return_value=RESULT),
+                  patch.object(bot, "fetch_ticket", return_value=fresh),
+                  patch.object(bot, "get_ticket_comments", return_value=fresh_comments),
+                  patch.object(bot, "z_put") as put):
+                self.assertFalse(bot.repair_order_validation_draft_once(TICKET, comments))
+            put.assert_not_called()
+
+    def test_current_policy_note_is_not_repaired_again_even_without_guard_tag(self):
+        comments = self.legacy_comments()
+        comments[-1]["body"] = bot.format_internal_draft(71, RESULT)
+        self.assertIsNone(bot.order_validation_repair_candidate(TICKET, comments))
 
 
 if __name__ == "__main__":
