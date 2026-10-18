@@ -33,6 +33,7 @@ if "flask" not in sys.modules:
 import bot_zendesk as bot
 from openai_draft import generate_draft
 from collaboration_draft import generate_collaboration_draft, HANDLED_PREFIX
+from social_profiles import customer_social_profiles
 
 
 TICKET = {"id": 42, "requester_id": 5, "subject": "Bag insert", "status": "open",
@@ -581,7 +582,7 @@ class CollaborationDecisionTests(unittest.TestCase):
             self.assertIn("ai_collab_sent_audit_900", update["tags"])
             self.assertIn("keep_me", update["tags"])
             self.assertTrue(update["safe_update"])
-            self.assertNotIn("status", update)
+            self.assertEqual(update["status"], "solved")
             self.assertNotIn("custom_fields", update)
 
     def test_changed_authorization_during_generation_does_not_send(self):
@@ -606,6 +607,7 @@ class CollaborationDecisionTests(unittest.TestCase):
 
         def save_then_timeout(_path, data):
             ticket["tags"] = data["ticket"]["tags"]
+            ticket["status"] = data["ticket"]["status"]
             comments.append({"id": 72, "author_id": 99, **data["ticket"]["comment"]})
             raise TimeoutError("The write succeeded but its response was lost")
 
@@ -618,6 +620,7 @@ class CollaborationDecisionTests(unittest.TestCase):
                 bot.handle_collaboration_decision(ticket, comments)
             self.assertFalse(bot.handle_collaboration_decision(ticket, comments))
         self.assertTrue(comments[-1]["public"])
+        self.assertEqual(ticket["status"], "solved")
         put.assert_called_once()
         generate.assert_called_once()
 
@@ -636,6 +639,7 @@ class CollaborationDecisionTests(unittest.TestCase):
             self.assertFalse(update["comment"]["public"])
             self.assertIn("AUTO-SEND WITHHELD", update["comment"]["body"])
             self.assertNotIn(bot.COLLAB_DECLINE_SENT_TAG, update["tags"])
+            self.assertNotIn("status", update)
 
     def test_approval_remains_private(self):
         ticket = self.ticket("collab_approved")
@@ -827,6 +831,126 @@ class CollaborationDecisionTests(unittest.TestCase):
               patch.object(bot, "z_put") as put):
             self.assertFalse(bot.handle_tracking_if_any(ticket))
         put.assert_not_called()
+
+
+class SocialProfileTests(unittest.TestCase):
+    def test_direct_profile_links_are_normalized_without_tracking_parameters(self):
+        c = {**CUSTOMER, "body": "Instagram: https://instagram.com/Maya.Style/?igsh=123. "
+             "TikTok: www.tiktok.com/@Maya_Style?lang=en#bio"}
+        self.assertEqual(customer_social_profiles([c], 5), {
+            "instagram": "https://www.instagram.com/maya.style/",
+            "tiktok": "https://www.tiktok.com/@maya_style"})
+
+    def test_markdown_mobile_and_labeled_handles(self):
+        for body in ("[IG](https://m.instagram.com/maya/) TikTok: @maya",
+                     "IG: @maya — TikTok profile is @maya",
+                     "instagram.com/maya/ https://m.tiktok.com/@maya"):
+            with self.subTest(body=body):
+                self.assertEqual(customer_social_profiles([{**CUSTOMER, "body": body}], 5), {
+                    "instagram": "https://www.instagram.com/maya/",
+                    "tiktok": "https://www.tiktok.com/@maya"})
+
+    def test_html_link_targets_are_detected_even_when_labels_hide_the_url(self):
+        c = {**CUSTOMER, "body": "Here are my profiles", "html_body":
+             '<p><a href="https://www.instagram.com/maya/?igsh=abc&amp;x=1">My IG</a>'
+             '<a href="https://www.tiktok.com/@maya">My TikTok</a></p>'}
+        self.assertEqual(len(customer_social_profiles([c], 5)), 2)
+
+    def test_duplicate_urls_count_once_but_different_profiles_are_ambiguous(self):
+        c = {**CUSTOMER, "body": "instagram.com/maya https://www.instagram.com/MAYA/?igsh=abc "
+             "TikTok: @maya"}
+        newer = {**CUSTOMER, "id": 72, "body": "My agency is instagram.com/agency"}
+        self.assertIn("instagram", customer_social_profiles([c], 5))
+        self.assertEqual(customer_social_profiles([c, newer], 5), {
+            "tiktok": "https://www.tiktok.com/@maya"})
+
+    def test_private_and_agent_comments_cannot_populate_social_fields(self):
+        c = {**CUSTOMER, "body": "instagram.com/guessed_profile/"}
+        self.assertEqual(customer_social_profiles([
+            {**c, "public": False}, {**c, "author_id": 99}], 5), {})
+
+    def test_posts_videos_shortlinks_and_lookalike_domains_are_not_profiles(self):
+        bad = ["https://www.instagram.com/p/abc", "instagram.com/reel/abc",
+               "instagram.com/stories/maya", "instagram.com/accounts/login",
+               "www.tiktok.com/@maya/video/123", "https://vt.tiktok.com/abc",
+               "https://www.instagram.com.evil.test/maya", "evilinstagram.com/maya",
+               "https://evil.test/instagram.com/maya", "https://evil.test@instagram.com/maya",
+               "https://instagram.com:443/maya", "@maya", "https://instagram.com/explore/"]
+        for body in bad:
+            with self.subTest(body=body):
+                self.assertEqual(customer_social_profiles([{**CUSTOMER, "body": body}], 5), {})
+
+    def test_social_fields_write_together_without_comment_status_or_tags(self):
+        c = {**CUSTOMER, "body": "IG: @maya TikTok: @maya"}
+        with (patch.object(bot, "fetch_ticket", return_value=TICKET),
+              patch.object(bot, "get_ticket_comments", return_value=[c]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.populate_social_profiles_if_missing(TICKET, [c]))
+        update = put.call_args.args[1]["ticket"]
+        self.assertEqual(set(update), {"custom_fields", "safe_update", "updated_stamp"})
+        self.assertEqual(update["custom_fields"], [
+            {"id": 39921224964114, "value": "https://www.instagram.com/maya/"},
+            {"id": 39921242636818, "value": "https://www.tiktok.com/@maya"}])
+        self.assertTrue(update["safe_update"])
+        self.assertEqual(update["updated_stamp"], TICKET["updated_at"])
+
+    def test_existing_social_values_are_never_overwritten(self):
+        c = {**CUSTOMER, "body": "IG: @maya TikTok: @maya"}
+        filled = {**TICKET, "custom_fields": [
+            {"id": bot.COLLAB_CONTEXT_FIELDS[p], "value": "https://manually-entered.example"}
+            for p in ("instagram", "tiktok")]}
+        with patch.object(bot, "z_put") as put, patch.object(bot, "fetch_ticket") as fetch:
+            self.assertFalse(bot.populate_social_profiles_if_missing(filled, [c]))
+        fetch.assert_not_called()
+        put.assert_not_called()
+
+    def test_social_recheck_preserves_a_racing_human_field_edit(self):
+        c = {**CUSTOMER, "body": "IG: @maya TikTok: @maya"}
+        fresh = {**TICKET, "custom_fields": [
+            {"id": bot.COLLAB_CONTEXT_FIELDS["instagram"], "value": "manual"}]}
+        with (patch.object(bot, "fetch_ticket", return_value=fresh),
+              patch.object(bot, "get_ticket_comments", return_value=[c]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.populate_social_profiles_if_missing(TICKET, [c]))
+        self.assertEqual(put.call_args.args[1]["ticket"]["custom_fields"], [
+            {"id": 39921242636818, "value": "https://www.tiktok.com/@maya"}])
+
+    def test_social_recheck_rejects_changed_conversation_or_requester(self):
+        old = {**CUSTOMER, "body": "IG: @maya"}
+        changed = {**CUSTOMER, "body": "IG: @different"}
+        for ticket, comments in ((TICKET, [changed]), ({**TICKET, "requester_id": 7}, [old])):
+            with (patch.object(bot, "fetch_ticket", return_value=ticket),
+                  patch.object(bot, "get_ticket_comments", return_value=comments),
+                  patch.object(bot, "z_put") as put):
+                self.assertFalse(bot.populate_social_profiles_if_missing(TICKET, [old]))
+            put.assert_not_called()
+
+    def test_social_timeout_after_success_does_not_repeat_write(self):
+        c = {**CUSTOMER, "body": "IG: @maya"}
+        saved = {**TICKET, "custom_fields": [
+            {"id": 39921224964114, "value": "https://www.instagram.com/maya/"}]}
+        with (patch.object(bot, "fetch_ticket", side_effect=[TICKET, saved]),
+              patch.object(bot, "get_ticket_comments", return_value=[c]),
+              patch.object(bot, "z_put", side_effect=TimeoutError) as put):
+            with self.assertRaises(TimeoutError):
+                bot.populate_social_profiles_if_missing(TICKET, [c])
+            self.assertFalse(bot.populate_social_profiles_if_missing(TICKET, [c]))
+        put.assert_called_once()
+
+    def test_social_fields_can_fill_on_solved_but_never_closed_tickets(self):
+        c = {**CUSTOMER, "body": "IG: @maya"}
+        solved = {**TICKET, "status": "solved"}
+        with (patch.object(bot, "fetch_ticket", return_value=solved),
+              patch.object(bot, "get_ticket_comments", return_value=[c]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.populate_social_profiles_if_missing(solved, [c]))
+        self.assertNotIn("status", put.call_args.args[1]["ticket"])
+        with patch.object(bot, "z_put") as put:
+            self.assertFalse(bot.populate_social_profiles_if_missing({**TICKET, "status": "closed"}, [c]))
+        put.assert_not_called()
+
+    def test_removed_other_social_field_is_not_read_or_written(self):
+        self.assertNotIn("other_social_profiles", bot.COLLAB_CONTEXT_FIELDS)
 
 
 if __name__ == "__main__":
