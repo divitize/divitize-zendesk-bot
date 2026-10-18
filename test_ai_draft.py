@@ -491,6 +491,44 @@ class CollaborationDecisionTests(unittest.TestCase):
         self.assertIsNone(bot.collaboration_decision(ticket))
         self.assertEqual(bot.collaboration_decision(self.ticket()), "collab_declined")
 
+    def test_creator_classification_is_saved_with_the_private_intake_note(self):
+        result = {**RESULT, "route": "creator", "needs_human_decision": True}
+        for ticket, expected in ((TICKET, True), (self.ticket(None), False)):
+            with (patch.object(bot, "fetch_ticket", return_value=ticket),
+                  patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+                  patch.object(bot, "z_put") as put):
+                self.assertTrue(bot.post_internal_draft_once(42, 71, result))
+            update = put.call_args.args[1]["ticket"]
+            self.assertEqual("custom_fields" in update, expected)
+            if expected:
+                self.assertEqual(update["custom_fields"], [
+                    {"id": int(bot.Z_INQUIRY_FIELD), "value": "collaborations"}])
+            self.assertFalse(update["comment"]["public"])
+
+    def test_creator_backfill_uses_latest_model_draft_and_only_empty_field(self):
+        creator = {"id": 72, "public": False, "body": bot.format_internal_draft(
+            71, {**RESULT, "route": "creator"})}
+        public_spoof = {**creator, "public": True, "author_id": 5}
+        newer = {**CUSTOMER, "id": 73, "body": "A different request"}
+        self.assertFalse(bot.latest_customer_has_creator_draft(TICKET, [CUSTOMER, public_spoof]))
+        self.assertFalse(bot.latest_customer_has_creator_draft(TICKET, [CUSTOMER, creator, newer]))
+        with (patch.object(bot, "fetch_ticket", return_value=TICKET),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER, creator]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.populate_collaboration_type_if_missing(TICKET, [CUSTOMER, creator]))
+        self.assertNotIn("comment", put.call_args.args[1]["ticket"])
+        self.assertNotIn("status", put.call_args.args[1]["ticket"])
+        with patch.object(bot, "z_put") as put:
+            self.assertFalse(bot.populate_collaboration_type_if_missing(self.ticket(None), [CUSTOMER, creator]))
+        put.assert_not_called()
+
+    def test_private_pilot_never_sets_the_inquiry_field(self):
+        with (patch.object(bot, "fetch_ticket", return_value=TICKET),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.post_internal_draft_once(42, 71, {**RESULT, "route": "creator"}, pilot=True))
+        self.assertNotIn("custom_fields", put.call_args.args[1]["ticket"])
+
     def test_decision_after_existing_intake_draft_is_private_and_preserves_fields(self):
         ticket = self.ticket(tags=["collaborations", "source_shopify_form", "tracking_sent_abc"])
         intake = {"id": 72, "public": False, "author_id": 99,
