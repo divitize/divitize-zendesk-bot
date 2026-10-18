@@ -49,9 +49,10 @@ Creator collaboration decisions:
   customer comment. A manually selected Inquiry type is never overwritten;
   approvals and declines are always selected by the human agent.
 - Set **Inquiry type = Collaborations**, select **Collaboration Status**, and
-  submit/save the ticket. While the bot is running, it adds one private decision
-  draft, even when an introductory private draft already exists. Nothing is sent
-  to the creator automatically. Review the newest decision draft and send manually.
+  submit/save the ticket. **Approved** creates a private draft for manual review.
+  A newly saved **Declined** or **Declined — Audience Reach** sends the generated
+  customer-facing reply directly, even if an unsent intake draft already exists.
+  The bot must be awake; batch processing may take several minutes.
 - Choices: Approved (`collab_approved`), Declined (`collab_declined`), and
   Declined — Audience Reach (`collab_declined_audience_reach`). Approval asks for
   a missing delivery address; the audience decline refers to expected visibility,
@@ -59,11 +60,21 @@ Creator collaboration decisions:
 - A decision draft explicitly supersedes earlier **unsent** drafts. Public replies
   remain authoritative conversation context. Subsequent creator messages use the
   selected decision as context rather than restarting intake.
-- The note and last-handled decision tag are saved in one safe update. Repeated
-  saves, polling and successful-but-timed-out writes do not repeat the draft.
-  Changing the decision creates a new private draft for human review. Clearing
-  and reselecting the same already-handled decision does not resend it.
-- Decisions can be drafted on solved tickets without reopening them; closed
+- The reply/note and last-handled decision tag are saved in one safe update.
+  Repeated saves, polling, restarts, and successful-but-timed-out writes do not
+  repeat the response. A permanent `ai_collab_decline_sent` guard allows only one
+  automatic decline per ticket, even if statuses are toggled later; any later
+  changed decision is a private draft. Approval always remains private.
+- Public sending requires the latest status-change audit to prove a web selection
+  by an agent/admin after `2026-10-18T14:24:00Z`. Old selections/drafts are never
+  retroactively sent. API/rule/customer edits cannot authorize sending. A public
+  reply in/after that selection blocks auto-send to avoid doubling a human reply.
+  The selection and public conversation are rechecked after generation.
+- Uncertain output requiring factual checks, protected Amazon/ChannelReply
+  channels, unknown integrations, and legacy selections stay private with an
+  explicit AUTO-SEND WITHHELD explanation. Internal notes are never published.
+  Later incoming creator messages still produce private follow-up drafts.
+- Decisions can be handled on solved tickets without reopening them; closed
   tickets cannot be changed. Customer-replacement tracking is skipped for tickets
   explicitly classified as Collaborations.
 - The existing single ticket form has five optional, agent-only fields. On this
