@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional
 from flask import Flask, jsonify
 from openai import OpenAI
 from openai_draft import POLICY_VERSION, generate_draft
+from social_profiles import customer_social_profiles
 from collaboration_draft import (
     COLLAB_POLICY_VERSION, DECISIONS, DECISION_MARKER, HANDLED_PREFIX,
     field_value, selected_decision, handled_decision, public_snapshot,
@@ -52,7 +53,6 @@ COLLAB_CONTEXT_FIELDS = {
     "content_status": "39921238350354",
     "instagram": "39921224964114",
     "tiktok": "39921242636818",
-    "other_social_profiles": "39921229607826",
 }
 
 # Tags fissi
@@ -1207,6 +1207,33 @@ def collaboration_context(ticket: Dict[str, Any]) -> Dict[str, Any]:
             for name, field_id in COLLAB_CONTEXT_FIELDS.items()}
 
 
+def populate_social_profiles_if_missing(ticket: Dict[str, Any],
+                                        comments: List[Dict[str, Any]]) -> bool:
+    """Fill only empty social fields, with no message/status/tag changes."""
+    profiles = customer_social_profiles(comments, ticket.get("requester_id"))
+    wanted = {platform: value for platform, value in profiles.items()
+              if not field_value(ticket, COLLAB_CONTEXT_FIELDS[platform])}
+    if not wanted or ticket.get("status") == "closed":
+        return False
+    fresh = fetch_ticket(ticket["id"])
+    if fresh.get("status") == "closed" or fresh.get("requester_id") != ticket.get("requester_id"):
+        return False
+    fresh_comments = get_ticket_comments(ticket["id"])
+    confirmed = customer_social_profiles(fresh_comments, fresh.get("requester_id"))
+    updates = [{"id": int(COLLAB_CONTEXT_FIELDS[platform]), "value": value}
+               for platform, value in wanted.items()
+               if not field_value(fresh, COLLAB_CONTEXT_FIELDS[platform])
+               and confirmed.get(platform) == value]
+    if not updates:
+        return False
+    if not fresh.get("updated_at"):
+        raise ValueError("Missing updated_at for a safe social profile update")
+    z_put(f"/tickets/{ticket['id']}.json", {"ticket": {
+        "custom_fields": updates, "safe_update": True, "updated_stamp": fresh["updated_at"],
+    }})
+    return True
+
+
 def latest_customer_has_creator_draft(ticket: Dict[str, Any],
                                       comments: List[Dict[str, Any]]) -> bool:
     """Reuse the model's existing classification, not keywords in a customer email."""
@@ -1340,7 +1367,7 @@ def handle_collaboration_decision(ticket: Dict[str, Any],
 
     The last-handled state is persisted with the note, so repeat polling, restarts,
     conflicts and successful-but-timed-out requests cannot create repeat drafts.
-    The public reply and permanent sent guard share the same safe update.
+    The public reply, solved status and permanent sent guard share one safe update.
     """
     decision = collaboration_decision(ticket)
     if (not decision or ticket.get("status") == "closed"
@@ -1393,11 +1420,14 @@ def handle_collaboration_decision(ticket: Dict[str, Any],
         note += ("\n\nAUTO-SEND WITHHELD: no eligible new human selection, a decline "
                  "was already sent, protected channel, or factual checks remain. "
                  "Nothing was sent automatically; review and send manually if appropriate.")
-    z_put(f"/tickets/{ticket['id']}.json", {"ticket": {
+    update = {
         "comment": {"public": send_public,
                     "body": result['reply'].strip() if send_public else note},
         "tags": sorted(set(tags)), "safe_update": True, "updated_stamp": updated_at,
-    }})
+    }
+    if send_public:
+        update["status"] = "solved"
+    z_put(f"/tickets/{ticket['id']}.json", {"ticket": update})
     return True
 
 
@@ -1558,7 +1588,7 @@ def process_once():
     if IS_PULL_REQUEST:
         process_private_draft_pilot_once()
         return
-    # 0) Fill an empty Order Number field, then tag origin, on non-closed tickets.
+    # 0) Fill empty order/social fields, then tag origin, on non-closed tickets.
     for t in list_recent_tickets():
         if t.get("status") == "closed":
             continue
@@ -1573,6 +1603,11 @@ def process_once():
                 print(f"[OK] Order Number populated for ticket {t['id']}")
         except Exception as e:
             print(f"[WARN] order number fail {t.get('id')}: {e}")
+        try:
+            if populate_social_profiles_if_missing(full, comments):
+                print(f"[OK] Social profiles populated for ticket {t['id']}")
+        except Exception as e:
+            print(f"[WARN] social profiles fail {t.get('id')}: {e}")
         if OPENAI_DRAFTS_ENABLED:
             try:
                 if populate_collaboration_type_if_missing(full, comments):
