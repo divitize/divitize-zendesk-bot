@@ -52,6 +52,8 @@ Creator collaboration decisions:
   submit/save the ticket. **Approved** creates a private draft for manual review.
   A newly saved **Declined** or **Declined — Audience Reach** sends the generated
   customer-facing reply directly, even if an unsent intake draft already exists.
+  The public decline, **Solved** status and duplicate-protection tags are saved
+  together in one safe update. A withheld/private draft does not solve the ticket.
   The bot must be awake; batch processing may take several minutes.
 - Choices: Approved (`collab_approved`), Declined (`collab_declined`), and
   Declined — Audience Reach (`collab_declined_audience_reach`). Approval asks for
@@ -77,10 +79,22 @@ Creator collaboration decisions:
 - Decisions can be handled on solved tickets without reopening them; closed
   tickets cannot be changed. Customer-replacement tracking is skipped for tickets
   explicitly classified as Collaborations.
-- The existing single ticket form has five optional, agent-only fields. On this
+- The existing single ticket form has four optional, agent-only fields. On this
   account's Support Team plan they are visible on every ticket, as approved by
   the account owner; conditional visibility is unavailable. Content Status is
   manual tracking only and does not trigger messages.
+- **Instagram** and **TikTok** automatically fill from explicit profile URLs or
+  clearly labelled @handles in public requester messages, including HTML links.
+  Tracking parameters are removed. Internal drafts/agent guesses, post/video URLs,
+  shortlinks and lookalike domains are not used. No profile pages are visited and
+  no extra OpenAI calls are needed. More than one distinct profile on a platform
+  is left for human review. Existing field values are never overwritten.
+  Field-only updates recheck the requester, conversation and current field values,
+  use safe_update, and never send a comment, change status, or replace ticket tags.
+  They run on recent non-closed tickets (including solved) while the bot is awake.
+- **Other Social Profiles** has been deactivated to remove it from the left
+  column without permanently deleting historical data. The bot no longer reads
+  or writes that field.
 
 Configured field IDs (Divitize):
 
@@ -91,7 +105,7 @@ Configured field IDs (Divitize):
 | Content Status | 39921238350354 |
 | Instagram | 39921224964114 |
 | TikTok | 39921242636818 |
-| Other Social Profiles | 39921229607826 |
+| Other Social Profiles (inactive; historical only) | 39921229607826 |
 
 Production runs on a Render Free web service, which can sleep after inactivity.
 Polling (including order-field updates and tracking) happens only while the
