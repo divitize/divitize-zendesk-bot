@@ -1195,6 +1195,7 @@ def repair_order_validation_draft_once(ticket, comments):
     fresh_comments = get_ticket_comments(ticket["id"])
     if (order_validation_repair_candidate(fresh, fresh_comments) != comment_id
             or fresh.get("requester_id") != ticket.get("requester_id")
+            or get_custom_field_value(fresh, Z_ORDER_FIELD) != get_custom_field_value(ticket, Z_ORDER_FIELD)
             or [(c.get("id"), c.get("body"), c.get("public")) for c in fresh_comments] != snapshot):
         return False
     if not fresh.get("updated_at"):
