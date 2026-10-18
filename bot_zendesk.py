@@ -9,6 +9,11 @@ from typing import List, Dict, Any, Optional
 from flask import Flask, jsonify
 from openai import OpenAI
 from openai_draft import POLICY_VERSION, generate_draft
+from collaboration_draft import (
+    COLLAB_POLICY_VERSION, DECISIONS, DECISION_MARKER, HANDLED_PREFIX,
+    field_value, selected_decision, handled_decision, public_snapshot,
+    generate_collaboration_draft,
+)
 
 # ============ ENV ============
 Z_SUBDOMAIN   = os.getenv("ZENDESK_SUBDOMAIN", "").strip()
@@ -35,6 +40,15 @@ DRAFT_TAG      = os.getenv("DRAFT_TAG", "chat_suggested_draft").strip()
 Z_TRACKING_FIELD = os.getenv("Z_TRACKING_FIELD", "").strip()
 # Zendesk ticket field "Order Number" in the Divitize workspace.
 Z_ORDER_FIELD = os.getenv("Z_ORDER_FIELD", "29113177850258").strip()
+# Optional agent-only collaboration fields; the original intake prompt is unchanged.
+Z_INQUIRY_FIELD = "28789187446674"
+Z_COLLAB_STATUS_FIELD = "39921183865618"
+COLLAB_CONTEXT_FIELDS = {
+    "content_status": "39921238350354",
+    "instagram": "39921224964114",
+    "tiktok": "39921242636818",
+    "other_social_profiles": "39921229607826",
+}
 
 # Tags fissi
 TAG_REPLACEMENT_SENT = "replacement_sent"                 # usato per automazione review
@@ -1170,8 +1184,81 @@ def compose_openai_draft(ticket: Dict[str, Any], comments: List[Dict[str, Any]])
     first_name = first_name or get_user_first_name(ticket.get("requester_id"))
     order_number = (get_custom_field_value(ticket, Z_ORDER_FIELD)
                     or customer_order_number(public_comments, ticket.get("requester_id")))
+    decision = collaboration_decision(ticket)
+    if decision:
+        return generate_collaboration_draft(
+            client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT, ticket, comments,
+            first_name, decision, collaboration_context(ticket), follow_up=True)
     return generate_draft(client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT,
                           ticket, comments, first_name, origin_hint, order_number)
+
+
+def collaboration_decision(ticket: Dict[str, Any]) -> Optional[str]:
+    return selected_decision(ticket, Z_INQUIRY_FIELD, Z_COLLAB_STATUS_FIELD)
+
+
+def collaboration_context(ticket: Dict[str, Any]) -> Dict[str, Any]:
+    return {name: field_value(ticket, field_id)
+            for name, field_id in COLLAB_CONTEXT_FIELDS.items()}
+
+
+def collaboration_comment_guard(comment_id: int) -> str:
+    return f"ai_collab_comment_{comment_id}"
+
+
+def handle_collaboration_decision(ticket: Dict[str, Any],
+                                  comments: List[Dict[str, Any]]) -> bool:
+    """A saved human decision can supersede intake, with one atomic private write.
+
+    The last-handled state is persisted with the note, so repeat polling, restarts,
+    conflicts and successful-but-timed-out requests cannot create repeat drafts.
+    Changing the selected decision creates a new private proposal for review.
+    """
+    decision = collaboration_decision(ticket)
+    if (not decision or ticket.get("status") == "closed"
+            or handled_decision(ticket, comments) == decision):
+        return False
+    public_comments = [c for c in comments if c.get("public")]
+    if not public_comments:
+        return False
+    snapshot = public_snapshot(comments)
+    first_name = (extract_first_name_from_shopify_body(public_comments)
+                  or get_user_first_name(ticket.get("requester_id")))
+    result = generate_collaboration_draft(
+        client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT, ticket, comments,
+        first_name, decision, collaboration_context(ticket))
+    fresh = fetch_ticket(ticket["id"])
+    fresh_comments = get_ticket_comments(ticket["id"])
+    if (fresh.get("status") == "closed"
+            or collaboration_decision(fresh) != decision
+            or handled_decision(fresh, fresh_comments) == decision
+            or public_snapshot(fresh_comments) != snapshot
+            or collaboration_context(fresh) != collaboration_context(ticket)):
+        return False
+    updated_at = fresh.get("updated_at")
+    if not updated_at:
+        raise ValueError("Missing updated_at for a safe collaboration update")
+    customer_ids = [c.get("id") for c in public_comments
+                    if c.get("author_id") == ticket.get("requester_id")]
+    tags = [tag for tag in fresh.get("tags") or [] if not tag.startswith(HANDLED_PREFIX)]
+    tags.extend([DRAFT_TAG, HANDLED_PREFIX + decision])
+    if customer_ids:
+        tags.append(collaboration_comment_guard(customer_ids[-1]))
+    checks = "\n".join(f"- {item}" for item in result["facts_to_verify"]) or "- None identified"
+    note = (
+        f"{DECISION_MARKER}{decision}\n"
+        f"Policy: {COLLAB_POLICY_VERSION} | Human selection: {DECISIONS[decision]}\n"
+        "CURRENT COLLABORATION DECISION DRAFT — review and send manually.\n"
+        "This supersedes earlier UNSENT introductory or decision drafts; "
+        "previously sent public replies remain part of the conversation.\n\n"
+        f"PROPOSED CUSTOMER REPLY:\n{result['reply'].strip()}\n\n"
+        f"AGENT NOTES — do not send:\n{result['agent_note'].strip()}\nVerify:\n{checks}"
+    )
+    z_put(f"/tickets/{ticket['id']}.json", {"ticket": {
+        "comment": {"public": False, "body": note},
+        "tags": sorted(set(tags)), "safe_update": True, "updated_stamp": updated_at,
+    }})
+    return True
 
 
 def format_internal_draft(customer_comment_id: int, result: Dict[str, Any]) -> str:
@@ -1200,6 +1287,11 @@ def post_internal_draft_once(ticket_id: int, customer_comment_id: int,
     fresh_ticket = fetch_ticket(ticket_id)
     fresh_comments = get_ticket_comments(ticket_id)
     if fresh_ticket.get("status") in ("solved", "closed"):
+        return False
+    decision = collaboration_decision(fresh_ticket)
+    if decision and (handled_decision(fresh_ticket, fresh_comments) != decision
+                     or collaboration_comment_guard(customer_comment_id)
+                     in (fresh_ticket.get("tags") or [])):
         return False
     if draft_guard_tag(customer_comment_id) in (fresh_ticket.get("tags") or []):
         return False
@@ -1260,7 +1352,8 @@ def handle_tracking_if_any(ticket: Dict[str,Any]) -> bool:
         return False
 
     comments = get_ticket_comments(ticket_id)
-    if is_creator_conversation(comments):
+    if (is_creator_conversation(comments)
+            or field_value(ticket, Z_INQUIRY_FIELD) == "collaborations"):
         print(f"[INFO] Creator ticket {ticket_id}: tracking requires human handling")
         return False
 
@@ -1356,6 +1449,18 @@ def process_once():
     if not OPENAI_DRAFTS_ENABLED:
         return
 
+    # Human collaboration decisions have priority over any unsent intake draft.
+    for t in list_recent_tickets():
+        if not collaboration_decision(t) or t.get("status") == "closed":
+            continue
+        try:
+            full = fetch_ticket(t["id"])
+            comments = get_ticket_comments(t["id"])
+            if handle_collaboration_decision(full, comments):
+                print(f"[OK] Private collaboration decision draft created for ticket {t['id']}")
+        except Exception as e:
+            print(f"[ERROR collaboration decision] {t.get('id')}: {e}")
+
     # 3) Bozze interne (risposte) solo quando serve
     for t in list_recent_tickets():
         ticket_id = t["id"]
@@ -1384,6 +1489,11 @@ def process_once():
             full = fetch_ticket(ticket_id)
             customer_comment_id = comments[-1].get("id")
             if customer_comment_id is None or already_drafted_for_comment(comments, customer_comment_id):
+                continue
+            decision = collaboration_decision(full)
+            if decision and (handled_decision(full, comments) != decision
+                             or collaboration_comment_guard(customer_comment_id)
+                             in (full.get("tags") or [])):
                 continue
             result = compose_openai_draft(full, comments)
             if post_internal_draft_once(ticket_id, customer_comment_id, result):
