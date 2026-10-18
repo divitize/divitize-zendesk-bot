@@ -43,6 +43,11 @@ Private-draft trial on a Render pull-request preview:
 Creator collaboration decisions:
 
 - The existing creator intake instructions in `openai_draft.py` are unchanged.
+- The model's existing `creator` route automatically fills an empty **Inquiry
+  type** with **Collaborations**, alongside the private intake note. It also
+  backfills empty Inquiry type from an existing creator draft for the latest
+  customer comment. A manually selected Inquiry type is never overwritten;
+  approvals and declines are always selected by the human agent.
 - Set **Inquiry type = Collaborations**, select **Collaboration Status**, and
   submit/save the ticket. While the bot is running, it adds one private decision
   draft, even when an introductory private draft already exists. Nothing is sent
