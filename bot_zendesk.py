@@ -4,6 +4,8 @@ import os
 import re
 import time
 import threading
+import json
+from datetime import datetime
 import requests
 from typing import List, Dict, Any, Optional
 from flask import Flask, jsonify
@@ -43,6 +45,9 @@ Z_ORDER_FIELD = os.getenv("Z_ORDER_FIELD", "29113177850258").strip()
 # Optional agent-only collaboration fields; the original intake prompt is unchanged.
 Z_INQUIRY_FIELD = "28789187446674"
 Z_COLLAB_STATUS_FIELD = "39921183865618"
+# Fixed release boundary: existing saved declines are NEVER retroactively sent.
+COLLAB_DIRECT_SEND_SINCE = "2026-10-18T14:24:00Z"
+COLLAB_DECLINE_SENT_TAG = "ai_collab_decline_sent"
 COLLAB_CONTEXT_FIELDS = {
     "content_status": "39921238350354",
     "instagram": "39921224964114",
@@ -1242,13 +1247,86 @@ def collaboration_comment_guard(comment_id: int) -> str:
     return f"ai_collab_comment_{comment_id}"
 
 
+def collaboration_decline_authorization(ticket: Dict[str, Any], decision: str):
+    """Return a new human selection's audit ID, or fail closed to a private draft.
+
+    Only web selections by an agent/admin after this release permit a public
+    decline. Email wording, tags, API/rule edits and old selections never do.
+    One automatic decline per ticket, even if the decision is toggled later.
+    """
+    if (decision not in ("collab_declined", "collab_declined_audience_reach")
+            or COLLAB_DECLINE_SENT_TAG in (ticket.get("tags") or [])):
+        return None
+    via = ticket.get("via") or {}
+    # Unknown integrations and Amazon messaging must remain draft-only.
+    source = json.dumps({"via": via, "tags": ticket.get("tags") or []}).lower()
+    if (via.get("channel") not in ("email", "web")
+            or any(token in source for token in (
+                "sellercentral", "seller_central", "seller-central", "channelreply",
+                "marketplace.amazon.", "buyer_seller", "buyer-seller"))):
+        return None
+    cutoff = datetime.fromisoformat(COLLAB_DIRECT_SEND_SINCE.replace("Z", "+00:00"))
+    cursor = None
+    newer_public_reply = False
+    # A bounded read is intentionally fail-closed on very long histories.
+    for _ in range(10):
+        params = {"page[size]": 100, "sort_order": "desc",
+                  "include_boundary_indicators": "true"}
+        if cursor:
+            params["page[after]"] = cursor
+        page = z_get(f"/tickets/{ticket['id']}/audits.json", params)
+        for audit in page.get("audits") or []:
+            events = audit.get("events") or []
+            public_reply = any(e.get("type") == "Comment" and e.get("public")
+                               for e in events)
+            changes = [e for e in events if e.get("type") in ("Change", "Create")
+                       and str(e.get("field_name")) == Z_COLLAB_STATUS_FIELD]
+            if changes:
+                event = changes[-1]
+                created = datetime.fromisoformat((audit.get("created_at") or "").replace("Z", "+00:00"))
+                event_via = event.get("via") or audit.get("via") or {}
+                if (event.get("value") != decision or created.tzinfo is None
+                        or created <= cutoff or newer_public_reply or public_reply
+                        or event_via.get("channel") != "web"
+                        or (event.get("type") == "Change"
+                            and event.get("previous_value") == decision)):
+                    return None
+                author_id = audit.get("author_id")
+                if not isinstance(author_id, int):
+                    return None
+                author = z_get(f"/users/{author_id}.json").get("user") or {}
+                if author.get("role") not in ("agent", "admin") or author.get("suspended"):
+                    return None
+                return audit.get("id")
+            newer_public_reply = newer_public_reply or public_reply
+        meta = page.get("meta") or {}
+        if not meta.get("has_more"):
+            return None
+        next_cursor = meta.get("after_cursor")
+        if not next_cursor or next_cursor == cursor:
+            raise RuntimeError("Collaboration audit pagination stalled; no reply sent")
+        cursor = next_cursor
+    return None
+
+
+def collaboration_reply_safe_to_send(result: Dict[str, Any]) -> bool:
+    """Never publish internal checks or a result still requiring factual checks."""
+    reply = result.get("reply")
+    if not isinstance(reply, str) or not 40 <= len(reply.strip()) <= 4000:
+        return False
+    return (result.get("route") == "creator" and not result.get("facts_to_verify")
+            and not any(token in reply.lower() for token in (
+                "agent notes", "facts_to_verify", "ai_collab_", "ai_draft_",
+                "proposed customer reply", "review and send manually")))
+
+
 def handle_collaboration_decision(ticket: Dict[str, Any],
                                   comments: List[Dict[str, Any]]) -> bool:
-    """A saved human decision can supersede intake, with one atomic private write.
+    """Human declines send once; approval and unsafe/legacy cases stay private.
 
     The last-handled state is persisted with the note, so repeat polling, restarts,
     conflicts and successful-but-timed-out requests cannot create repeat drafts.
-    Changing the selected decision creates a new private proposal for review.
+    The public reply and permanent sent guard share the same safe update.
     """
     decision = collaboration_decision(ticket)
     if (not decision or ticket.get("status") == "closed"
@@ -1258,6 +1336,7 @@ def handle_collaboration_decision(ticket: Dict[str, Any],
     if not public_comments:
         return False
     snapshot = public_snapshot(comments)
+    authorization = collaboration_decline_authorization(ticket, decision)
     first_name = (extract_first_name_from_shopify_body(public_comments)
                   or get_user_first_name(ticket.get("requester_id")))
     result = generate_collaboration_draft(
@@ -1274,6 +1353,9 @@ def handle_collaboration_decision(ticket: Dict[str, Any],
     updated_at = fresh.get("updated_at")
     if not updated_at:
         raise ValueError("Missing updated_at for a safe collaboration update")
+    send_public = bool(authorization and collaboration_reply_safe_to_send(result))
+    if send_public and collaboration_decline_authorization(fresh, decision) != authorization:
+        return False
     customer_ids = [c.get("id") for c in public_comments
                     if c.get("author_id") == ticket.get("requester_id")]
     tags = [tag for tag in fresh.get("tags") or [] if not tag.startswith(HANDLED_PREFIX)]
@@ -1290,8 +1372,16 @@ def handle_collaboration_decision(ticket: Dict[str, Any],
         f"PROPOSED CUSTOMER REPLY:\n{result['reply'].strip()}\n\n"
         f"AGENT NOTES — do not send:\n{result['agent_note'].strip()}\nVerify:\n{checks}"
     )
+    if send_public:
+        tags.append(COLLAB_DECLINE_SENT_TAG)
+        tags.append(f"ai_collab_sent_audit_{authorization}")
+    elif decision != "collab_approved":
+        note += ("\n\nAUTO-SEND WITHHELD: no eligible new human selection, a decline "
+                 "was already sent, protected channel, or factual checks remain. "
+                 "Nothing was sent automatically; review and send manually if appropriate.")
     z_put(f"/tickets/{ticket['id']}.json", {"ticket": {
-        "comment": {"public": False, "body": note},
+        "comment": {"public": send_public,
+                    "body": result['reply'].strip() if send_public else note},
         "tags": sorted(set(tags)), "safe_update": True, "updated_stamp": updated_at,
     }})
     return True
@@ -1503,7 +1593,7 @@ def process_once():
             full = fetch_ticket(t["id"])
             comments = get_ticket_comments(t["id"])
             if handle_collaboration_decision(full, comments):
-                print(f"[OK] Private collaboration decision draft created for ticket {t['id']}")
+                print(f"[OK] Collaboration decision handled for ticket {t['id']}")
         except Exception as e:
             print(f"[ERROR collaboration decision] {t.get('id')}: {e}")
 
