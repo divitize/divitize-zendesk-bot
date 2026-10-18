@@ -19,6 +19,25 @@ or `order ID is 1234` wording. Ambiguous messages are skipped; an existing
 field is never overwritten. The update contains no comment, status, or tag,
 uses Zendesk's safe update, and rechecks the ticket before writing.
 
+Order-number format checks are shared between field extraction and AI case data
+in `order_numbers.py`. Amazon-shaped identifiers with malformed digit groups
+(for example a six-digit final group) are not saved, guessed, or padded. The
+model receives an explicit `order_number_validation` state and is instructed to
+ask the customer to copy/resend the full number when identification is needed,
+rather than thanking them as if a usable number was received. Format-valid is
+still not order verification. A later complete correction supersedes the typo;
+a later malformed identifier does not silently fall back to an earlier number.
+Existing human-entered field values are never overwritten.
+
+Policy `divitize-2026-10-18-v5` also makes one private correction to an outdated
+unsent v4 bot draft affected by a malformed Amazon number (such as ticket752).
+This runs only on recent non-solved/non-closed tickets whose latest comment is
+the affected bot draft and whose latest public message is the requester’s.
+New human replies/notes, changed order data and saved repair markers prevent
+replacement/repetition. The corrected note explicitly supersedes the old unsent
+draft; it never sends publicly or changes fields/status. Normal draft guards
+and tracking behavior are otherwise unchanged.
+
 New settings:
 
 - `OPENAI_DRAFTS_ENABLED=true` enables the AI draft path. It defaults to `false`.

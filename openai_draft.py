@@ -2,9 +2,10 @@
 
 import json
 from typing import Any, Dict, List, Optional
+from order_numbers import order_number_validation
 
 
-POLICY_VERSION = "divitize-2026-10-15-v4"
+POLICY_VERSION = "divitize-2026-10-18-v5"
 
 INSTRUCTIONS = """You draft thoughtful, natural customer-service replies for Divitize.
 You are writing a proposed reply for a human agent to review in Zendesk, never a message to send automatically.
@@ -13,6 +14,7 @@ Read the entire public conversation. Identify the customer's CURRENT intent and 
 Reason through the case before drafting: what is known, what is only claimed, what was already promised, what single missing fact would change the answer, and whether the issue concerns an insert, chain/strap, order, shipping, refund, or creator collaboration. Do not expose private chain-of-thought. Give the agent only a short decision summary and facts to verify.
 
 Business policy:
+- Order-number validation takes precedence over the rules below about a number already being supplied. Read order_number_validation in the case data. If status is malformed_amazon, the customer attempted to provide a number but its digit groups do not match the expected 3-7-7 Amazon format. If identifying the order is needed, gently say it looks incomplete or mistyped and ask them to copy and resend the full order number from their Amazon order details. This request must be in the CUSTOMER-FACING reply, not just agent notes. You can acknowledge their attempt, but do not thank them as if a usable number was received. Never guess a missing digit, pad with zeros, silently correct it, or claim the order is identified or the replacement is arranged. Keep the free replacement/no-return policy and relevant fit questions. If status is ambiguous, ask which complete order number applies; do not choose one. If the public conversation explicitly shows an agent already found the order or started the replacement, respect that evidence rather than reopening identification. A provided_unverified status means only a number was provided, never that an order lookup or ownership check succeeded. A later complete corrected number supersedes the earlier typo; do not keep asking for it.
 - Amazon orders: a replacement and its shipping are free. If an Amazon order number is supplied, put order/channel verification in facts_to_verify for the agent before sending; do not claim verified order facts. Keep this internal check out of the customer-facing reply. If the order number is missing and the customer wants a replacement, ask the customer for their Amazon order number in the proposed reply so Noe can find the original order, unless the public conversation already shows that an agent identified the order or started the replacement. This is customer information needed to proceed, not merely an internal verification step. Do not say that the replacement has been arranged, is being made, or will ship before the order can be found. You may explain the free replacement and no-return policy while asking. If the number is already in the ticket field or conversation, do not ask for it again. When the customer has supplied the information needed to proceed (for example, an order number and an accepted material or measurement), acknowledge their decision and explain the next step without making them wait on an internal check in the wording (for example, "once we've verified your Amazon order"). If verification fails, the agent must revise the draft before sending it.
 - For other replacement requests too, if no order number has been supplied and the conversation does not show that an agent already identified the original order, ask the customer for their order number in the proposed reply. Do not ask again if the number is already available. If an agent has already confirmed that the order was located or that a replacement is in progress, respect that context instead of reopening the identification step.
 - Apply the same order-identification rule to implicit replacement requests: a customer who already bought an organizer and asks to recreate it, change its material, or get an alternative to the one they received needs their original order located, even if they never use the word "replacement". Ask for the missing order number in the customer-facing reply, not only in agent notes. Knowing the bag model, customer name, or email does not establish that the order was located. An offer to help or discuss a replacement also does not establish this. Distinguish these after-sales cases from a new purchase or general pre-sale material question, where an order number is unnecessary. Do not infer the purchase channel from the bag model or the request alone.
@@ -54,6 +56,7 @@ def public_case_data(ticket: Dict[str, Any], comments: List[Dict[str, Any]],
     """Send public conversation and minimal ticket metadata, not old private bot drafts."""
     transcript = []
     requester_id = ticket.get("requester_id")
+    validation = order_number_validation(comments, requester_id, order_number)
     for comment in comments:
         if not comment.get("public"):
             continue
@@ -67,7 +70,9 @@ def public_case_data(ticket: Dict[str, Any], comments: List[Dict[str, Any]],
         "subject": ticket.get("subject") or "",
         "customer_first_name": first_name,
         "source_hint_unverified": source_hint,
-        "order_number_provided_unverified": order_number,
+        "order_number_provided_unverified": (None if validation["requires_customer_correction"]
+                                             else order_number),
+        "order_number_validation": validation,
         "conversation": transcript,
         "verified_order_facts": None,  # No Amazon/Shopify order lookup exists in this bot yet.
     }

@@ -12,6 +12,10 @@ from flask import Flask, jsonify
 from openai import OpenAI
 from openai_draft import POLICY_VERSION, generate_draft
 from social_profiles import customer_social_profiles
+from order_numbers import (
+    ORDER_PAT, LABELED_ORDER_PAT, order_numbers_in_message, customer_order_number,
+    order_number_validation,
+)
 from collaboration_draft import (
     COLLAB_POLICY_VERSION, DECISIONS, DECISION_MARKER, HANDLED_PREFIX,
     field_value, selected_decision, handled_decision, public_snapshot,
@@ -167,15 +171,7 @@ def get_custom_field_value(ticket: Dict[str, Any], field_id: str) -> Optional[st
     return None
 
 # ============ HEURISTICHE DI TESTO ============
-# Amazon order, including one or two line breaks immediately after a hyphen
-# in an email (Zendesk ticket #736 has two).
-# Keep the three digit groups exact; the captured groups become the canonical value.
-ORDER_PAT = re.compile(r"(?<!\d)(\d{3})-[ \t]*(?:\r?\n[ \t]*){0,2}(\d{7})-[ \t]*(?:\r?\n[ \t]*){0,2}(\d{7})\b")
-# Other channels: require an explicit order label, never an unlabelled number.
-LABELED_ORDER_PAT = re.compile(
-    r"\border\s*(?:number|no\.?|id)?\s*(?::|=|\bis\b)?\s*(#?\d{3,9})\b(?!-\d)",
-    re.I,
-)
+# Order parsing is shared with draft validation in order_numbers.py.
 URL_PAT = re.compile(r'https?://[^\s)>\]]+', re.I)
 MEASURES_PAT = re.compile(
     r'\b(\d{1,2}(\.\d{1,2})?)\s*[x×]\s*(\d{1,2}(\.\d{1,2})?)\s*[x×]\s*(\d{1,2}(\.\d{1,2})?)\b',
@@ -439,23 +435,6 @@ def extract_order_number(text: str) -> Optional[str]:
     if not text: return None
     m = ORDER_PAT.search(text)
     return "-".join(m.groups()) if m else None
-
-def order_numbers_in_message(text: str) -> List[str]:
-    """Return distinct recognizable order numbers in one customer message."""
-    text = text or ""
-    found = ["-".join(match.groups()) for match in ORDER_PAT.finditer(text)]
-    found.extend(match.group(1) for match in LABELED_ORDER_PAT.finditer(text))
-    return list(dict.fromkeys(found))
-
-def customer_order_number(comments: List[Dict[str, Any]], requester_id: int) -> Optional[str]:
-    """Use the most recent customer message with exactly one recognizable order."""
-    for comment in reversed(comments):
-        if not comment.get("public") or comment.get("author_id") != requester_id:
-            continue
-        numbers = order_numbers_in_message(comment.get("body") or "")
-        if numbers:
-            return numbers[0] if len(numbers) == 1 else None
-    return None
 
 def populate_order_number_if_missing(ticket: Dict[str, Any],
                                      comments: List[Dict[str, Any]]) -> bool:
@@ -1181,6 +1160,58 @@ def already_drafted_for_comment(comments: List[Dict[str, Any]], comment_id: int)
     return any(not c.get("public") and marker in (c.get("body") or "") for c in comments)
 
 
+def order_validation_repair_candidate(ticket, comments):
+    """Only the last unsent v4 bot note with a malformed order needs replacement."""
+    if (not comments or ticket.get("status") in ("solved", "closed")
+            or collaboration_decision(ticket)):
+        return None
+    public = [c for c in comments if c.get("public")]
+    if not public or public[-1].get("author_id") != ticket.get("requester_id"):
+        return None
+    comment_id = public[-1].get("id")
+    guard = f"ai_order_validation_repair_{comment_id}"
+    last = comments[-1]
+    lines = (last.get("body") or "").split("\n", 2)
+    if (not isinstance(comment_id, int) or guard in (ticket.get("tags") or [])
+            or last.get("public") or len(lines) < 2
+            or lines[0] != draft_marker(comment_id)
+            or not lines[1].startswith("Policy: divitize-2026-10-15-v4 |")
+            or "| Route: creator |" in lines[1]):
+        return None
+    number = get_custom_field_value(ticket, Z_ORDER_FIELD) or customer_order_number(
+        comments, ticket.get("requester_id"))
+    validation = order_number_validation(comments, ticket.get("requester_id"), number)
+    return comment_id if validation["status"] == "malformed_amazon" else None
+
+
+def repair_order_validation_draft_once(ticket, comments):
+    """One private v5 correction, never a customer send or a field/status change."""
+    comment_id = order_validation_repair_candidate(ticket, comments)
+    if comment_id is None:
+        return False
+    snapshot = [(c.get("id"), c.get("body"), c.get("public")) for c in comments]
+    result = compose_openai_draft(ticket, comments)
+    fresh = fetch_ticket(ticket["id"])
+    fresh_comments = get_ticket_comments(ticket["id"])
+    if (order_validation_repair_candidate(fresh, fresh_comments) != comment_id
+            or fresh.get("requester_id") != ticket.get("requester_id")
+            or get_custom_field_value(fresh, Z_ORDER_FIELD) != get_custom_field_value(ticket, Z_ORDER_FIELD)
+            or [(c.get("id"), c.get("body"), c.get("public")) for c in fresh_comments] != snapshot):
+        return False
+    if not fresh.get("updated_at"):
+        raise ValueError("Missing updated_at for a safe order-validation draft correction")
+    note = format_internal_draft(comment_id, result).replace(
+        "PROPOSED CUSTOMER REPLY", "CORRECTED ORDER-NUMBER DRAFT: supersedes the earlier "
+        "UNSENT draft for this customer message. Nothing sent automatically.\n\n"
+        "PROPOSED CUSTOMER REPLY", 1)
+    z_put(f"/tickets/{ticket['id']}.json", {"ticket": {
+        "comment": {"public": False, "body": note},
+        "additional_tags": [DRAFT_TAG, f"ai_order_validation_repair_{comment_id}"],
+        "safe_update": True, "updated_stamp": fresh["updated_at"],
+    }})
+    return True
+
+
 def compose_openai_draft(ticket: Dict[str, Any], comments: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Generate a new reply from case context, never a canned-template fallback."""
     public_comments = [c for c in comments if c.get("public")]
@@ -1659,6 +1690,15 @@ def process_once():
             print(f"[ERROR comments] {ticket_id}: {e}")
             continue
         if not comments:
+            continue
+
+        # Correct only an outdated unsent v4 draft affected by malformed order data.
+        if order_validation_repair_candidate(t, comments) is not None:
+            try:
+                if repair_order_validation_draft_once(t, comments):
+                    print(f"[OK] Private order-validation draft corrected for ticket {ticket_id}")
+            except Exception as e:
+                print(f"[ERROR order-validation repair] {ticket_id}: {e}")
             continue
 
         # ultimo è pubblico del cliente?
