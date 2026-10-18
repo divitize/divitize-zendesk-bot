@@ -1202,6 +1202,42 @@ def collaboration_context(ticket: Dict[str, Any]) -> Dict[str, Any]:
             for name, field_id in COLLAB_CONTEXT_FIELDS.items()}
 
 
+def latest_customer_has_creator_draft(ticket: Dict[str, Any],
+                                      comments: List[Dict[str, Any]]) -> bool:
+    """Reuse the model's existing classification, not keywords in a customer email."""
+    latest = next((c for c in reversed(comments)
+                   if c.get("public") and c.get("author_id") == ticket.get("requester_id")), None)
+    if not latest:
+        return False
+    marker = draft_marker(latest.get("id"))
+    for comment in comments:
+        lines = (comment.get("body") or "").split("\n", 2)
+        if (not comment.get("public") and len(lines) > 1
+                and lines[0] == marker and "| Route: creator |" in lines[1]):
+            return True
+    return False
+
+
+def populate_collaboration_type_if_missing(ticket: Dict[str, Any],
+                                            comments: List[Dict[str, Any]]) -> bool:
+    """Backfill only an empty Inquiry type from the latest model-classified draft."""
+    if field_value(ticket, Z_INQUIRY_FIELD) or not latest_customer_has_creator_draft(ticket, comments):
+        return False
+    fresh = fetch_ticket(ticket["id"])
+    fresh_comments = get_ticket_comments(ticket["id"])
+    if (fresh.get("status") == "closed" or field_value(fresh, Z_INQUIRY_FIELD)
+            or not latest_customer_has_creator_draft(fresh, fresh_comments)):
+        return False
+    updated_at = fresh.get("updated_at")
+    if not updated_at:
+        raise ValueError("Missing updated_at for a safe collaboration classification")
+    z_put(f"/tickets/{ticket['id']}.json", {"ticket": {
+        "custom_fields": [{"id": int(Z_INQUIRY_FIELD), "value": "collaborations"}],
+        "safe_update": True, "updated_stamp": updated_at,
+    }})
+    return True
+
+
 def collaboration_comment_guard(comment_id: int) -> str:
     return f"ai_collab_comment_{comment_id}"
 
@@ -1317,6 +1353,10 @@ def post_internal_draft_once(ticket_id: int, customer_comment_id: int,
         "safe_update": True,
         "updated_stamp": updated_at,
     }}
+    if (not pilot and result.get("route") == "creator"
+            and not field_value(fresh_ticket, Z_INQUIRY_FIELD)):
+        payload["ticket"]["custom_fields"] = [
+            {"id": int(Z_INQUIRY_FIELD), "value": "collaborations"}]
     z_put(f"/tickets/{ticket_id}.json", payload)
     return True
 
@@ -1429,6 +1469,12 @@ def process_once():
                 print(f"[OK] Order Number populated for ticket {t['id']}")
         except Exception as e:
             print(f"[WARN] order number fail {t.get('id')}: {e}")
+        if OPENAI_DRAFTS_ENABLED:
+            try:
+                if populate_collaboration_type_if_missing(full, comments):
+                    print(f"[OK] Collaboration inquiry classified for ticket {t['id']}")
+            except Exception as e:
+                print(f"[WARN] collaboration classification fail {t.get('id')}: {e}")
         try:
             origin = classify_origin(full, comments)
             tag_origin(full["id"], origin)
