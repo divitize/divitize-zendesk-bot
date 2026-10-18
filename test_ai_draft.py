@@ -531,9 +531,19 @@ class CollaborationDecisionTests(unittest.TestCase):
                 self.assertIsNone(self.real_authorize(ticket, "collab_declined"))
 
     def test_public_reply_after_selection_blocks_automated_double_response(self):
-        audit = {"events": [{"type": "Comment", "public": True}]}
+        audit = {"id": 901, "created_at": "2026-10-18T15:01:00Z",
+                 "events": [{"type": "Comment", "public": True}]}
         with patch.object(bot, "z_get", return_value={"audits": [audit, self.audit()]}):
             self.assertIsNone(self.real_authorize(self.ticket(via={"channel": "web"}), "collab_declined"))
+
+    def test_oldest_first_audits_still_use_latest_selection(self):
+        initial = {"id": 800, "created_at": "2026-10-18T14:00:00Z",
+                   "events": [{"type": "Comment", "public": True}]}
+        old = self.audit("collab_approved", id=850, created_at="2026-10-18T14:23:00Z")
+        for audits in ([initial, old, self.audit()], [self.audit(), initial, old]):
+            with patch.object(bot, "z_get", side_effect=[{"audits": audits},
+                                                         {"user": {"role": "agent"}}]):
+                self.assertEqual(self.real_authorize(self.ticket(via={"channel": "web"}), "collab_declined"), 900)
 
     def test_protected_channels_and_sent_guard_never_authorize_public_send(self):
         cases = [self.ticket(via={"channel": "api"}), self.ticket(),
@@ -586,6 +596,30 @@ class CollaborationDecisionTests(unittest.TestCase):
               patch.object(bot, "z_put") as put):
             self.assertFalse(bot.handle_collaboration_decision(ticket, [CUSTOMER]))
         put.assert_not_called()
+
+    def test_public_send_that_succeeds_but_times_out_is_not_repeated(self):
+        self.authorize.return_value = 900
+        ticket = self.ticket()
+        comments = [CUSTOMER]
+        result = {**RESULT, "route": "creator", "facts_to_verify": [],
+                  "reply": "Hi Maya, unfortunately we won't be moving forward with this collaboration. Noe"}
+
+        def save_then_timeout(_path, data):
+            ticket["tags"] = data["ticket"]["tags"]
+            comments.append({"id": 72, "author_id": 99, **data["ticket"]["comment"]})
+            raise TimeoutError("The write succeeded but its response was lost")
+
+        with (patch.object(bot, "generate_collaboration_draft", return_value=result) as generate,
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=comments),
+              patch.object(bot, "z_put", side_effect=save_then_timeout) as put):
+            with self.assertRaises(TimeoutError):
+                bot.handle_collaboration_decision(ticket, comments)
+            self.assertFalse(bot.handle_collaboration_decision(ticket, comments))
+        self.assertTrue(comments[-1]["public"])
+        put.assert_called_once()
+        generate.assert_called_once()
 
     def test_uncertain_or_internal_output_stays_private(self):
         self.authorize.return_value = 900

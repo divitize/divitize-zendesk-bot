@@ -1267,45 +1267,59 @@ def collaboration_decline_authorization(ticket: Dict[str, Any], decision: str):
         return None
     cutoff = datetime.fromisoformat(COLLAB_DIRECT_SEND_SINCE.replace("Z", "+00:00"))
     cursor = None
-    newer_public_reply = False
+    audits = []
     # A bounded read is intentionally fail-closed on very long histories.
     for _ in range(10):
-        params = {"page[size]": 100, "sort_order": "desc",
+        params = {"page[size]": 100, "sort": "-created_at", "sort_order": "desc",
                   "include_boundary_indicators": "true"}
         if cursor:
             params["page[after]"] = cursor
         page = z_get(f"/tickets/{ticket['id']}/audits.json", params)
-        for audit in page.get("audits") or []:
-            events = audit.get("events") or []
-            public_reply = any(e.get("type") == "Comment" and e.get("public")
-                               for e in events)
-            changes = [e for e in events if e.get("type") in ("Change", "Create")
-                       and str(e.get("field_name")) == Z_COLLAB_STATUS_FIELD]
-            if changes:
-                event = changes[-1]
-                created = datetime.fromisoformat((audit.get("created_at") or "").replace("Z", "+00:00"))
-                event_via = event.get("via") or audit.get("via") or {}
-                if (event.get("value") != decision or created.tzinfo is None
-                        or created <= cutoff or newer_public_reply or public_reply
-                        or event_via.get("channel") != "web"
-                        or (event.get("type") == "Change"
-                            and event.get("previous_value") == decision)):
-                    return None
-                author_id = audit.get("author_id")
-                if not isinstance(author_id, int):
-                    return None
-                author = z_get(f"/users/{author_id}.json").get("user") or {}
-                if author.get("role") not in ("agent", "admin") or author.get("suspended"):
-                    return None
-                return audit.get("id")
-            newer_public_reply = newer_public_reply or public_reply
+        audits.extend(page.get("audits") or [])
         meta = page.get("meta") or {}
         if not meta.get("has_more"):
-            return None
+            if page.get("next_page"):
+                raise RuntimeError("Incomplete collaboration audit history; no reply sent")
+            break
         next_cursor = meta.get("after_cursor")
         if not next_cursor or next_cursor == cursor:
             raise RuntimeError("Collaboration audit pagination stalled; no reply sent")
         cursor = next_cursor
+    else:
+        return None
+    # This account returned oldest-first despite sort_order=desc. Read all
+    # pages and sort locally; never mistake the initial inquiry for a later reply.
+    def audit_order(audit):
+        stamp = datetime.fromisoformat((audit.get("created_at") or "").replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError("Missing timezone in collaboration audit; no reply sent")
+        return stamp, int(audit["id"])
+
+    newer_public_reply = False
+    for audit in sorted(audits, key=audit_order, reverse=True):
+        events = audit.get("events") or []
+        public_reply = any(e.get("type") == "Comment" and e.get("public")
+                           for e in events)
+        changes = [e for e in events if e.get("type") in ("Change", "Create")
+                   and str(e.get("field_name")) == Z_COLLAB_STATUS_FIELD]
+        if changes:
+            event = changes[-1]
+            created = audit_order(audit)[0]
+            event_via = event.get("via") or audit.get("via") or {}
+            if (event.get("value") != decision or created <= cutoff
+                    or newer_public_reply or public_reply
+                    or event_via.get("channel") != "web"
+                    or (event.get("type") == "Change"
+                        and event.get("previous_value") == decision)):
+                return None
+            author_id = audit.get("author_id")
+            if not isinstance(author_id, int):
+                return None
+            author = z_get(f"/users/{author_id}.json").get("user") or {}
+            if author.get("role") not in ("agent", "admin") or author.get("suspended"):
+                return None
+            return audit.get("id")
+        newer_public_reply = newer_public_reply or public_reply
     return None
 
 
