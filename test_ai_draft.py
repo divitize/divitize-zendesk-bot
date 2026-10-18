@@ -32,6 +32,7 @@ if "flask" not in sys.modules:
 
 import bot_zendesk as bot
 from openai_draft import generate_draft
+from collaboration_draft import generate_collaboration_draft, HANDLED_PREFIX
 
 
 TICKET = {"id": 42, "requester_id": 5, "subject": "Bag insert", "status": "open",
@@ -473,6 +474,165 @@ class AIDraftTests(unittest.TestCase):
         self.assertIn("Please disregard", update["comment"]["body"])
         self.assertEqual([t for t in update["tags"] if t.startswith("tracking_sent_")],
                          ["tracking_sent_a123"])
+
+
+class CollaborationDecisionTests(unittest.TestCase):
+    def ticket(self, decision="collab_declined", **overrides):
+        return {**TICKET, "custom_fields": [
+            {"id": bot.Z_INQUIRY_FIELD, "value": "collaborations"},
+            {"id": bot.Z_COLLAB_STATUS_FIELD, "value": decision},
+        ], **overrides}
+
+    def test_only_saved_collaboration_fields_authorize_a_decision(self):
+        self.assertIsNone(bot.collaboration_decision(TICKET))
+        self.assertIsNone(bot.collaboration_decision(self.ticket(None)))
+        ticket = self.ticket()
+        ticket["custom_fields"][0]["value"] = "returns"
+        self.assertIsNone(bot.collaboration_decision(ticket))
+        self.assertEqual(bot.collaboration_decision(self.ticket()), "collab_declined")
+
+    def test_decision_after_existing_intake_draft_is_private_and_preserves_fields(self):
+        ticket = self.ticket(tags=["collaborations", "source_shopify_form", "tracking_sent_abc"])
+        intake = {"id": 72, "public": False, "author_id": 99,
+                  "body": bot.format_internal_draft(71, RESULT)}
+        comments = [CUSTOMER, intake]
+        with (patch.object(bot, "generate_collaboration_draft", return_value=RESULT) as generate,
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=comments),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.handle_collaboration_decision(ticket, comments))
+        generate.assert_called_once()
+        payload = put.call_args.args[1]["ticket"]
+        self.assertFalse(payload["comment"]["public"])
+        self.assertIn("supersedes earlier UNSENT", payload["comment"]["body"])
+        self.assertTrue(payload["safe_update"])
+        self.assertEqual(payload["updated_stamp"], ticket["updated_at"])
+        self.assertEqual(set(payload), {"comment", "tags", "safe_update", "updated_stamp"})
+        self.assertIn("tracking_sent_abc", payload["tags"])
+        self.assertIn(HANDLED_PREFIX + "collab_declined", payload["tags"])
+        self.assertIn(bot.collaboration_comment_guard(71), payload["tags"])
+
+    def test_repeat_poll_or_timeout_does_not_repeat_the_decision(self):
+        ticket = self.ticket()
+        saved = {**ticket, "tags": [HANDLED_PREFIX + "collab_declined"]}
+        with (patch.object(bot, "generate_collaboration_draft", return_value=RESULT) as generate,
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put", side_effect=TimeoutError) as put):
+            with self.assertRaises(TimeoutError):
+                bot.handle_collaboration_decision(ticket, [CUSTOMER])
+            self.assertFalse(bot.handle_collaboration_decision(saved, [CUSTOMER]))
+        put.assert_called_once()
+        generate.assert_called_once()
+
+    def test_private_note_also_prevents_repeat_if_state_tag_missing(self):
+        saved = {"id": 72, "public": False,
+                 "body": "AI_COLLAB_DECISION=collab_declined\nSaved decision"}
+        with patch.object(bot, "generate_collaboration_draft") as generate:
+            self.assertFalse(bot.handle_collaboration_decision(self.ticket(), [CUSTOMER, saved]))
+        generate.assert_not_called()
+
+    def test_changed_decision_or_public_reply_during_generation_is_not_written(self):
+        ticket = self.ticket()
+        newer = {**CUSTOMER, "id": 73, "body": "Here is an updated proposal."}
+        for fresh, comments in ((self.ticket("collab_approved"), [CUSTOMER]),
+                                (ticket, [CUSTOMER, newer])):
+            with (self.subTest(fresh=fresh, comments=comments),
+                  patch.object(bot, "generate_collaboration_draft", return_value=RESULT),
+                  patch.object(bot, "get_user_first_name", return_value="Maya"),
+                  patch.object(bot, "fetch_ticket", return_value=fresh),
+                  patch.object(bot, "get_ticket_comments", return_value=comments),
+                  patch.object(bot, "z_put") as put):
+                self.assertFalse(bot.handle_collaboration_decision(ticket, [CUSTOMER]))
+            put.assert_not_called()
+
+    def test_competing_worker_state_prevents_second_write(self):
+        ticket = self.ticket()
+        fresh = {**ticket, "tags": [HANDLED_PREFIX + "collab_declined"]}
+        with (patch.object(bot, "generate_collaboration_draft", return_value=RESULT),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "fetch_ticket", return_value=fresh),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.handle_collaboration_decision(ticket, [CUSTOMER]))
+        put.assert_not_called()
+
+    def test_decision_changes_a_to_b_to_a_each_create_one_private_draft(self):
+        ticket = self.ticket(tags=["keep_me"])
+        comments = [CUSTOMER]
+
+        def save(_path, data):
+            update = data["ticket"]
+            ticket["tags"] = update["tags"]
+            comments.append({"id": len(comments) + 72, **update["comment"]})
+
+        with (patch.object(bot, "generate_collaboration_draft", return_value=RESULT),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "fetch_ticket", side_effect=lambda _id: ticket),
+              patch.object(bot, "get_ticket_comments", side_effect=lambda _id: comments),
+              patch.object(bot, "z_put", side_effect=save) as put):
+            for value in ("collab_declined", "collab_approved", "collab_declined"):
+                ticket["custom_fields"][1]["value"] = value
+                self.assertTrue(bot.handle_collaboration_decision(ticket, comments))
+                self.assertFalse(bot.handle_collaboration_decision(ticket, comments))
+        self.assertEqual(put.call_count, 3)
+        self.assertIn("keep_me", ticket["tags"])
+        self.assertEqual([t for t in ticket["tags"] if t.startswith(HANDLED_PREFIX)],
+                         [HANDLED_PREFIX + "collab_declined"])
+
+    def test_solved_ticket_gets_private_decision_without_reopening(self):
+        ticket = self.ticket(status="solved")
+        with (patch.object(bot, "generate_collaboration_draft", return_value=RESULT),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.handle_collaboration_decision(ticket, [CUSTOMER]))
+        self.assertNotIn("status", put.call_args.args[1]["ticket"])
+
+    def test_inflight_intake_draft_cannot_overwrite_selected_decision(self):
+        for ticket in (self.ticket(), self.ticket(tags=[HANDLED_PREFIX + "collab_declined",
+                                                       bot.collaboration_comment_guard(71)])):
+            with (patch.object(bot, "fetch_ticket", return_value=ticket),
+                  patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+                  patch.object(bot, "z_put") as put):
+                self.assertFalse(bot.post_internal_draft_once(42, 71, RESULT))
+            put.assert_not_called()
+
+    def test_decision_generator_only_uses_public_messages_and_selected_reason(self):
+        customer = {**CUSTOMER, "body": "I'd like to collaborate on a bag organizer video."}
+        old_draft = {"id": 72, "public": False, "body": "Unsent: ask for social profiles."}
+        client = FakeClient(RESULT)
+        result = generate_collaboration_draft(
+            client, "gpt-6.1-sol", "medium", self.ticket(), [customer, old_draft],
+            "Maya", "collab_declined_audience_reach", {"instagram": "https://instagram.com/example"})
+        case = json.loads(client.calls[0]["input"])
+        self.assertEqual(case["human_selected_collaboration_decision"], "Declined — Audience Reach")
+        self.assertEqual(len(case["conversation"]), 1)
+        self.assertEqual(case["task"], "communicate_selected_decision")
+        self.assertIs(client.calls[0]["store"], False)
+        self.assertTrue(result["needs_human_decision"])
+        self.assertEqual(result["route"], "creator")
+
+    def test_follow_up_after_decision_uses_decision_context(self):
+        ticket = self.ticket("collab_approved")
+        with (patch.object(bot, "generate_collaboration_draft", return_value=RESULT) as generate,
+              patch.object(bot, "get_user_first_name", return_value="Maya")):
+            bot.compose_openai_draft(ticket, [CUSTOMER])
+        self.assertTrue(generate.call_args.kwargs["follow_up"])
+        self.assertEqual(generate.call_args.args[6], "collab_approved")
+
+    def test_creator_field_alone_prevents_customer_replacement_tracking(self):
+        ticket = self.ticket()
+        ticket["custom_fields"].append({"id": "tracking_field", "value": "ABC123"})
+        with (patch.object(bot, "Z_TRACKING_FIELD", "tracking_field"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.handle_tracking_if_any(ticket))
+        put.assert_not_called()
 
 
 if __name__ == "__main__":
