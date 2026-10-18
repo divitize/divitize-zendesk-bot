@@ -1074,6 +1074,7 @@ class OrderValidationTests(unittest.TestCase):
             ({**TICKET, "status": "solved"}, comments),
             ({**TICKET, "status": "closed"}, comments),
             ({**TICKET, "custom_fields": [{"id": bot.Z_ORDER_FIELD, "value": "113-8325661-3460228"}]}, comments),
+            ({**TICKET, "custom_fields": [{"id": bot.Z_ORDER_FIELD, "value": "113-8325661-34602"}]}, comments),
         ]
         for fresh, fresh_comments in cases:
             with (self.subTest(fresh=fresh, fresh_comments=fresh_comments),
