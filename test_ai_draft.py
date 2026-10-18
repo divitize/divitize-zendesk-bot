@@ -210,6 +210,33 @@ class AIDraftTests(unittest.TestCase):
         self.assertEqual(case["order_number_provided_unverified"], "113-4771136-5412247")
         self.assertIsNone(case["verified_order_facts"])
 
+    def test_support_flow_guidance_reaches_the_same_single_model_call(self):
+        client = FakeClient(RESULT)
+        generate_draft(client, "gpt-6.1-sol", "medium", TICKET,
+                       [CUSTOMER], "Maya", "amazon_qr")
+        self.assertEqual(len(client.calls), 1)
+        request = client.calls[0]
+        self.assertEqual(request["model"], "gpt-6.1-sol")
+        self.assertEqual(request["reasoning"], {"effort": "medium"})
+        instructions = request["instructions"]
+        self.assertIn("Write a connected conversation, not a checklist", instructions)
+        self.assertIn("so I can find your original order", instructions)
+        self.assertIn("To help us get the fit right this time", instructions)
+        self.assertIn('Do not mechanically insert "however"', instructions)
+        self.assertIn("not make the free-replacement policy sound conditional", instructions)
+
+    def test_support_flow_examples_preserve_context_and_safety_rules(self):
+        client = FakeClient(RESULT)
+        generate_draft(client, "gpt-6.1-sol", "medium", TICKET,
+                       [CUSTOMER], "Maya", "amazon_qr")
+        instructions = client.calls[0]["instructions"]
+        self.assertIn("illustrations of cohesion, not scripts", instructions)
+        self.assertIn("do not ask again for the height or add a photo requirement", instructions)
+        self.assertIn("smoother wording has not dropped required facts", instructions)
+        self.assertIn("Creator discovery questions and collaboration-decision guidance are unchanged", instructions)
+        self.assertIn("Never guess a missing digit", instructions)
+        self.assertIn("Keep this internal check out of the customer-facing reply", instructions)
+
     def test_customer_order_number_is_available_before_field_is_filled(self):
         customer = {**CUSTOMER, "body": "My Amazon order is 113-4771136-5412247."}
         with (patch.object(bot, "client", FakeClient(RESULT)),
