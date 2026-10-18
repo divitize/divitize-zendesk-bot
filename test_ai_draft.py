@@ -477,6 +477,12 @@ class AIDraftTests(unittest.TestCase):
 
 
 class CollaborationDecisionTests(unittest.TestCase):
+    def setUp(self):
+        self.real_authorize = bot.collaboration_decline_authorization
+        patcher = patch.object(bot, "collaboration_decline_authorization", return_value=None)
+        self.authorize = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def ticket(self, decision="collab_declined", **overrides):
         return {**TICKET, "custom_fields": [
             {"id": bot.Z_INQUIRY_FIELD, "value": "collaborations"},
@@ -490,6 +496,122 @@ class CollaborationDecisionTests(unittest.TestCase):
         ticket["custom_fields"][0]["value"] = "returns"
         self.assertIsNone(bot.collaboration_decision(ticket))
         self.assertEqual(bot.collaboration_decision(self.ticket()), "collab_declined")
+
+    def audit(self, decision="collab_declined", **overrides):
+        return {"id": 900, "author_id": 99, "created_at": "2026-10-18T15:00:00Z",
+                "via": {"channel": "web"}, "events": [
+                    {"type": "Change", "field_name": bot.Z_COLLAB_STATUS_FIELD,
+                     "value": decision, "previous_value": None}], **overrides}
+
+    def test_public_decline_requires_new_web_selection_by_staff(self):
+        ticket = self.ticket(via={"channel": "email"})
+        for decision in ("collab_declined", "collab_declined_audience_reach"):
+            audit = self.audit(decision)
+            with patch.object(bot, "z_get", side_effect=[{"audits": [audit]},
+                                                         {"user": {"role": "agent"}}]):
+                self.assertEqual(self.real_authorize(ticket, decision), 900)
+
+    def test_old_or_nonhuman_declines_never_authorize_public_send(self):
+        ticket = self.ticket(via={"channel": "web"})
+        cases = [
+            self.audit(created_at="2026-10-18T14:23:59Z"),
+            self.audit(via={"channel": "api"}),
+            self.audit(via={"channel": "rule"}),
+            self.audit("collab_approved"),
+            self.audit(events=[{"type": "Change", "field_name": bot.Z_COLLAB_STATUS_FIELD,
+                                "value": "collab_declined", "previous_value": "collab_declined"}]),
+            self.audit(events=self.audit()["events"] + [{"type": "Comment", "public": True}]),
+        ]
+        for audit in cases:
+            with self.subTest(audit=audit), patch.object(bot, "z_get", return_value={"audits": [audit]}):
+                self.assertIsNone(self.real_authorize(ticket, "collab_declined"))
+        for role in ("end-user", None):
+            with patch.object(bot, "z_get", side_effect=[{"audits": [self.audit()]},
+                                                         {"user": {"role": role}}]):
+                self.assertIsNone(self.real_authorize(ticket, "collab_declined"))
+
+    def test_public_reply_after_selection_blocks_automated_double_response(self):
+        audit = {"events": [{"type": "Comment", "public": True}]}
+        with patch.object(bot, "z_get", return_value={"audits": [audit, self.audit()]}):
+            self.assertIsNone(self.real_authorize(self.ticket(via={"channel": "web"}), "collab_declined"))
+
+    def test_protected_channels_and_sent_guard_never_authorize_public_send(self):
+        cases = [self.ticket(via={"channel": "api"}), self.ticket(),
+                 self.ticket(via={"channel": "email"}, tags=["channelreply"]),
+                 self.ticket(via={"channel": "email", "source": {
+                     "from": {"address": "buyer@marketplace.amazon.com"}}}),
+                 self.ticket(via={"channel": "web"}, tags=[bot.COLLAB_DECLINE_SENT_TAG])]
+        for ticket in cases:
+            with self.subTest(ticket=ticket), patch.object(bot, "z_get") as get:
+                self.assertIsNone(self.real_authorize(ticket, "collab_declined"))
+            get.assert_not_called()
+
+    def test_audit_pagination_checks_latest_actual_field_change(self):
+        with patch.object(bot, "z_get", side_effect=[
+                {"audits": [], "meta": {"has_more": True, "after_cursor": "next"}},
+                {"audits": [self.audit()]}, {"user": {"role": "admin"}}]) as get:
+            self.assertEqual(self.real_authorize(self.ticket(via={"channel": "web"}), "collab_declined"), 900)
+        self.assertEqual(get.call_args_list[1].args[1]["page[after]"], "next")
+
+    def test_both_declines_send_only_reply_and_atomic_permanent_guard(self):
+        self.authorize.return_value = 900
+        result = {**RESULT, "route": "creator", "facts_to_verify": [],
+                  "reply": "Hi Maya, unfortunately we won't be moving forward with this collaboration. Noe"}
+        for decision in ("collab_declined", "collab_declined_audience_reach"):
+            ticket = self.ticket(decision, via={"channel": "web"}, tags=["keep_me"])
+            with (patch.object(bot, "generate_collaboration_draft", return_value=result),
+                  patch.object(bot, "get_user_first_name", return_value="Maya"),
+                  patch.object(bot, "fetch_ticket", return_value=ticket),
+                  patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+                  patch.object(bot, "z_put") as put):
+                self.assertTrue(bot.handle_collaboration_decision(ticket, [CUSTOMER]))
+            update = put.call_args.args[1]["ticket"]
+            self.assertEqual(update["comment"], {"public": True, "body": result["reply"]})
+            self.assertIn(bot.COLLAB_DECLINE_SENT_TAG, update["tags"])
+            self.assertIn("ai_collab_sent_audit_900", update["tags"])
+            self.assertIn("keep_me", update["tags"])
+            self.assertTrue(update["safe_update"])
+            self.assertNotIn("status", update)
+            self.assertNotIn("custom_fields", update)
+
+    def test_changed_authorization_during_generation_does_not_send(self):
+        self.authorize.side_effect = [900, 901]
+        ticket = self.ticket()
+        result = {**RESULT, "route": "creator", "facts_to_verify": [],
+                  "reply": "Hi Maya, unfortunately we won't be moving forward with this collaboration. Noe"}
+        with (patch.object(bot, "generate_collaboration_draft", return_value=result),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put") as put):
+            self.assertFalse(bot.handle_collaboration_decision(ticket, [CUSTOMER]))
+        put.assert_not_called()
+
+    def test_uncertain_or_internal_output_stays_private(self):
+        self.authorize.return_value = 900
+        for result in (RESULT, {**RESULT, "route": "creator", "facts_to_verify": [],
+                               "reply": "AGENT NOTES: this is private information, do not send this note."}):
+            ticket = self.ticket()
+            with (patch.object(bot, "generate_collaboration_draft", return_value=result),
+                  patch.object(bot, "get_user_first_name", return_value="Maya"),
+                  patch.object(bot, "fetch_ticket", return_value=ticket),
+                  patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+                  patch.object(bot, "z_put") as put):
+                self.assertTrue(bot.handle_collaboration_decision(ticket, [CUSTOMER]))
+            update = put.call_args.args[1]["ticket"]
+            self.assertFalse(update["comment"]["public"])
+            self.assertIn("AUTO-SEND WITHHELD", update["comment"]["body"])
+            self.assertNotIn(bot.COLLAB_DECLINE_SENT_TAG, update["tags"])
+
+    def test_approval_remains_private(self):
+        ticket = self.ticket("collab_approved")
+        with (patch.object(bot, "generate_collaboration_draft", return_value=RESULT),
+              patch.object(bot, "get_user_first_name", return_value="Maya"),
+              patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[CUSTOMER]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.handle_collaboration_decision(ticket, [CUSTOMER]))
+        self.assertFalse(put.call_args.args[1]["ticket"]["comment"]["public"])
 
     def test_creator_classification_is_saved_with_the_private_intake_note(self):
         result = {**RESULT, "route": "creator", "needs_human_decision": True}
