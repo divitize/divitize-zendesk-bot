@@ -40,6 +40,43 @@ Private-draft trial on a Render pull-request preview:
   free-instance hours. Never enable the pilot variables on the production
   service as a substitute for a preview.
 
+Creator collaboration decisions:
+
+- The existing creator intake instructions in `openai_draft.py` are unchanged.
+- Set **Inquiry type = Collaborations**, select **Collaboration Status**, and
+  submit/save the ticket. While the bot is running, it adds one private decision
+  draft, even when an introductory private draft already exists. Nothing is sent
+  to the creator automatically. Review the newest decision draft and send manually.
+- Choices: Approved (`collab_approved`), Declined (`collab_declined`), and
+  Declined — Audience Reach (`collab_declined_audience_reach`). Approval asks for
+  a missing delivery address; the audience decline refers to expected visibility,
+  not prioritising larger creators. Replies adapt to the public conversation.
+- A decision draft explicitly supersedes earlier **unsent** drafts. Public replies
+  remain authoritative conversation context. Subsequent creator messages use the
+  selected decision as context rather than restarting intake.
+- The note and last-handled decision tag are saved in one safe update. Repeated
+  saves, polling and successful-but-timed-out writes do not repeat the draft.
+  Changing the decision creates a new private draft for human review. Clearing
+  and reselecting the same already-handled decision does not resend it.
+- Decisions can be drafted on solved tickets without reopening them; closed
+  tickets cannot be changed. Customer-replacement tracking is skipped for tickets
+  explicitly classified as Collaborations.
+- The existing single ticket form has five optional, agent-only fields. On this
+  account's Support Team plan they are visible on every ticket, as approved by
+  the account owner; conditional visibility is unavailable. Content Status is
+  manual tracking only and does not trigger messages.
+
+Configured field IDs (Divitize):
+
+| Field | ID |
+| --- | --- |
+| Inquiry type (existing) | 28789187446674 |
+| Collaboration Status | 39921183865618 |
+| Content Status | 39921238350354 |
+| Instagram | 39921224964114 |
+| TikTok | 39921242636818 |
+| Other Social Profiles | 39921229607826 |
+
 Production runs on a Render Free web service, which can sleep after inactivity.
 Polling (including order-field updates and tracking) happens only while the
 service is awake. Keep only one bot instance running to avoid competing writes.
