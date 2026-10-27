@@ -19,6 +19,24 @@ or `order ID is 1234` wording. Ambiguous messages are skipped; an existing
 field is never overwritten. The update contains no comment, status, or tag,
 uses Zendesk's safe update, and rechecks the ticket before writing.
 
+Shopify's 4-6 digit storefront references are saved in ERP format with the fixed
+`3325573-` prefix: `Order #1893` becomes `3325573-1893`, and `Order 10000`
+becomes `3325573-10000`. An already-prefixed reference is never prefixed twice.
+Recognize explicit order wording, a standalone `#1893`, or a bare number in
+direct reply to a public agent request for the order number. Arbitrary years,
+measurements, bag models, phone and tracking numbers are not treated as orders.
+Only public requester messages count; ambiguous references are left for review.
+A short number explicitly described as Amazon is not converted to Shopify.
+Existing field values, including manually entered short references, remain intact.
+
+Recognized Shopify-order tickets receive `source_shopify_order` instead of
+`source_generic_email`; the obsolete generic tag is removed in the same safe
+tag update. Other tags, including draft/tracking guards and human tags, are
+preserved. Shopify form inquiries without an order still use `source_shopify_form`.
+Tagging rechecks the latest ticket/comments, skips unchanged tags and closed
+tickets, and uses `updated_stamp` so concurrent changes are not overwritten.
+These metadata-only updates never post a reply, change status, or make an AI call.
+
 Order-number format checks are shared between field extraction and AI case data
 in `order_numbers.py`. Amazon-shaped identifiers with malformed digit groups
 (for example a six-digit final group) are not saved, guessed, or padded. The
