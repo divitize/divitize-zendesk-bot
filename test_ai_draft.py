@@ -1118,5 +1118,177 @@ class OrderValidationTests(unittest.TestCase):
         self.assertIsNone(bot.order_validation_repair_candidate(TICKET, comments))
 
 
+class ShopifyOrderTests(unittest.TestCase):
+    def customer(self, body, **extra):
+        return {**CUSTOMER, "body": body, **extra}
+
+    def test_short_order_formats_are_prefixed_at_all_supported_lengths(self):
+        for short in ("1893", "9999", "10000", "99999", "100000", "999999"):
+            for body in (f"Order #{short}", f"Order number: {short}", f"Order ID is {short}"):
+                with self.subTest(body=body):
+                    self.assertEqual(bot.customer_order_field_number([self.customer(body)], 5),
+                                     "3325573-" + short)
+
+    def test_prefixed_number_is_recognized_once_and_not_ambiguous_with_short_version(self):
+        for body in ("3325573-1893", "Order 3325573-1893", "Order #1893 (ERP 3325573-1893)"):
+            with self.subTest(body=body):
+                self.assertEqual(bot.customer_order_field_number([self.customer(body)], 5),
+                                 "3325573-1893")
+
+    def test_prefix_is_only_for_four_to_six_digits(self):
+        for number in ("123", "1234567", "113-4771136-5412247", "3325573-1893-2",
+                       "3325573-1234567", "3325573-3325573-1893"):
+            with self.subTest(number=number):
+                self.assertIsNone(bot.shopify_erp_number(number))
+
+    def test_bare_number_is_recognized_after_public_agent_order_request(self):
+        agent = {"id": 70, "author_id": 99, "public": True,
+                 "body": "Could you please send your order number so I can find your purchase?"}
+        for body in ("1893", "10000", "999999."):
+            with self.subTest(body=body):
+                comments = [agent, self.customer(body)]
+                self.assertEqual(bot.customer_order_field_number(comments, 5),
+                                 "3325573-" + body.rstrip("."))
+                self.assertEqual(order_number_validation(comments, 5)["status"], "provided_unverified")
+
+    def test_hash_only_number_is_explicit_without_previous_agent_request(self):
+        self.assertEqual(bot.customer_order_field_number([self.customer("#1893")], 5),
+                         "3325573-1893")
+
+    def test_arbitrary_year_measurement_phone_tracking_and_bag_model_are_not_orders(self):
+        agent = {"author_id": 99, "public": True, "body": "What height would you like in mm?"}
+        for body in ("2026", "1900", "My bag is a model 1893", "Tracking: 123456",
+                     "Phone: 555123456", "Height 1893 mm", "Date 2026-10-27"):
+            with self.subTest(body=body):
+                self.assertIsNone(bot.customer_order_field_number([agent, self.customer(body)], 5))
+
+    def test_private_agent_or_other_customer_numbers_are_never_used(self):
+        for comment in (self.customer("Order #1893", public=False),
+                        self.customer("Order #1893", author_id=99)):
+            with self.subTest(comment=comment):
+                self.assertIsNone(bot.customer_order_field_number([comment], 5))
+        private_request = {"author_id": 99, "public": False, "body": "Send the order number?"}
+        self.assertIsNone(bot.customer_order_field_number([private_request, self.customer("1893")], 5))
+
+    def test_amazon_numbers_keep_original_format_and_short_amazon_claim_is_not_shopify(self):
+        self.assertEqual(bot.customer_order_field_number(
+            [self.customer("Amazon order 113-4771136-5412247")], 5), "113-4771136-5412247")
+        for comments in ([self.customer("My Amazon order number is 1893")],
+                         [{"author_id": 99, "public": True, "body": "Send your Amazon order number?"},
+                          self.customer("1893")]):
+            with self.subTest(comments=comments):
+                self.assertIsNone(bot.customer_order_field_number(comments, 5))
+                self.assertEqual(order_number_validation(comments, 5)["status"], "malformed_amazon")
+                self.assertEqual(bot.classify_origin(TICKET, comments), "generic_email")
+
+    def test_ambiguous_orders_are_skipped_and_later_correction_is_used(self):
+        ambiguous = [self.customer("Order #1893 or order #1894")]
+        self.assertIsNone(bot.customer_order_field_number(ambiguous, 5))
+        self.assertEqual(bot.classify_origin(TICKET, ambiguous), "generic_email")
+        corrected = ambiguous + [self.customer("Sorry, order #1894", id=72)]
+        self.assertEqual(bot.customer_order_field_number(corrected, 5), "3325573-1894")
+
+    def test_order_lists_do_not_silently_choose_one_reference(self):
+        for body in ("Order #1893 or #1894", "Order 1893 and 1894", "Order 1893, 1894, 1895",
+                     "Orders: 3325573-1893 / 1894"):
+            with self.subTest(body=body):
+                comments = [self.customer(body)]
+                self.assertIsNone(bot.customer_order_field_number(comments, 5))
+                self.assertEqual(order_number_validation(comments, 5)["status"], "ambiguous")
+
+    def test_field_fill_is_safe_and_metadata_only(self):
+        comments = [self.customer("Order #1893")]
+        with (patch.object(bot, "fetch_ticket", return_value=TICKET),
+              patch.object(bot, "get_ticket_comments", return_value=comments),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.populate_order_number_if_missing(TICKET, comments))
+        put.assert_called_once()
+        self.assertEqual(put.call_args.args[1]["ticket"], {
+            "custom_fields": [{"id": int(bot.Z_ORDER_FIELD), "value": "3325573-1893"}],
+            "safe_update": True, "updated_stamp": TICKET["updated_at"],
+        })
+
+    def test_manual_values_are_preserved_even_when_short(self):
+        for value in ("1893", "3325573-1893", "human-reference", "113-4771136-5412247"):
+            ticket = {**TICKET, "custom_fields": [{"id": bot.Z_ORDER_FIELD, "value": value}]}
+            with (self.subTest(value=value), patch.object(bot, "fetch_ticket") as fetch,
+                  patch.object(bot, "z_put") as put):
+                self.assertFalse(bot.populate_order_number_if_missing(ticket, [self.customer("Order #1894")]))
+            put.assert_not_called()
+            fetch.assert_not_called()
+
+    def test_field_fill_rechecks_requester_and_new_customer_order(self):
+        for ticket, comments in (({**TICKET, "requester_id": 88}, [self.customer("Order #1893")]),
+                                 (TICKET, [self.customer("Order #1894")])):
+            with (self.subTest(ticket=ticket, comments=comments),
+                  patch.object(bot, "fetch_ticket", return_value=ticket),
+                  patch.object(bot, "get_ticket_comments", return_value=comments),
+                  patch.object(bot, "z_put") as put):
+                self.assertFalse(bot.populate_order_number_if_missing(TICKET, [self.customer("Order #1893")]))
+            put.assert_not_called()
+
+    def test_order_reference_classifies_email_as_shopify(self):
+        for ticket, comments in ((TICKET, [self.customer("Order #1893")]),
+                                 ({**TICKET, "custom_fields": [{"id": bot.Z_ORDER_FIELD,
+                                                               "value": "3325573-1893"}]}, [])):
+            with self.subTest(ticket=ticket):
+                self.assertEqual(bot.classify_origin(ticket, comments), "shopify")
+
+    def test_source_tag_replaces_generic_and_preserves_all_other_tags_atomically(self):
+        ticket = {**TICKET, "tags": ["source_generic_email", "tracking_sent_abc", "human_tag",
+                                     "ai_draft_comment_71"]}
+        with (patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[self.customer("Order #1893")]),
+              patch.object(bot, "z_put") as put):
+            self.assertTrue(bot.tag_origin(42))
+        self.assertEqual(put.call_args.args[1]["ticket"], {
+            "tags": sorted(["source_shopify_order", "tracking_sent_abc", "human_tag", "ai_draft_comment_71"]),
+            "safe_update": True, "updated_stamp": ticket["updated_at"],
+        })
+
+    def test_unchanged_source_tag_and_closed_ticket_do_not_write(self):
+        for ticket in ({**TICKET, "tags": ["source_shopify_order"]}, {**TICKET, "status": "closed"}):
+            with (self.subTest(ticket=ticket), patch.object(bot, "fetch_ticket", return_value=ticket),
+                  patch.object(bot, "get_ticket_comments", return_value=[self.customer("Order #1893")]),
+                  patch.object(bot, "z_put") as put):
+                self.assertFalse(bot.tag_origin(42))
+            put.assert_not_called()
+
+    def test_tag_timeout_after_save_is_not_repeated(self):
+        ticket = {**TICKET, "tags": ["source_generic_email"]}
+        def save_then_timeout(_path, data):
+            ticket["tags"] = data["ticket"]["tags"]
+            raise TimeoutError()
+        with (patch.object(bot, "fetch_ticket", return_value=ticket),
+              patch.object(bot, "get_ticket_comments", return_value=[self.customer("Order #1893")]),
+              patch.object(bot, "z_put", side_effect=save_then_timeout) as put):
+            with self.assertRaises(TimeoutError):
+                bot.tag_origin(42)
+            self.assertFalse(bot.tag_origin(42))
+        put.assert_called_once()
+
+    def test_amazon_and_form_without_order_keep_existing_classification(self):
+        cases = [(TICKET, [self.customer("Amazon 113-4771136-5412247")], "amazon_qr", "source_amazon_qr"),
+                 ({**TICKET, "via": {"source": {"rel": "shopify"}}}, [CUSTOMER], "shopify", "source_shopify_form"),
+                 (TICKET, [CUSTOMER], "generic_email", "source_generic_email")]
+        for ticket, comments, origin, source_tag in cases:
+            with (self.subTest(origin=origin), patch.object(bot, "fetch_ticket", return_value=ticket),
+                  patch.object(bot, "get_ticket_comments", return_value=comments),
+                  patch.object(bot, "z_put") as put):
+                self.assertEqual(bot.classify_origin(ticket, comments), origin)
+                self.assertTrue(bot.tag_origin(42))
+            self.assertIn(source_tag, put.call_args.args[1]["ticket"]["tags"])
+
+    def test_shopify_erp_reference_reaches_existing_draft_call_without_extra_call(self):
+        with (patch.object(bot, "client", FakeClient(RESULT)),
+              patch.object(bot, "get_user_first_name", return_value="Maya")):
+            bot.compose_openai_draft(TICKET, [self.customer("My order number is 1893")])
+            self.assertEqual(len(bot.client.calls), 1)
+            case = json.loads(bot.client.calls[0]["input"])
+        self.assertEqual(case["order_number_provided_unverified"], "3325573-1893")
+        self.assertEqual(case["order_number_validation"]["status"], "provided_unverified")
+        self.assertEqual(case["source_hint_unverified"], "shopify")
+
+
 if __name__ == "__main__":
     unittest.main()
