@@ -14,7 +14,7 @@ from openai_draft import POLICY_VERSION, generate_draft
 from social_profiles import customer_social_profiles
 from order_numbers import (
     ORDER_PAT, LABELED_ORDER_PAT, order_numbers_in_message, customer_order_number,
-    order_number_validation,
+    order_number_validation, customer_order_field_number, shopify_erp_number,
 )
 from collaboration_draft import (
     COLLAB_POLICY_VERSION, DECISIONS, DECISION_MARKER, HANDLED_PREFIX,
@@ -446,14 +446,15 @@ def populate_order_number_if_missing(ticket: Dict[str, Any],
     """
     if not Z_ORDER_FIELD or get_custom_field_value(ticket, Z_ORDER_FIELD):
         return False
-    number = customer_order_number(comments, ticket.get("requester_id"))
+    number = customer_order_field_number(comments, ticket.get("requester_id"))
     if not number:
         return False
     fresh_ticket = fetch_ticket(ticket["id"])
     if fresh_ticket.get("status") == "closed" or get_custom_field_value(fresh_ticket, Z_ORDER_FIELD):
         return False
     fresh_comments = get_ticket_comments(ticket["id"])
-    if customer_order_number(fresh_comments, fresh_ticket.get("requester_id")) != number:
+    if (fresh_ticket.get("requester_id") != ticket.get("requester_id")
+            or customer_order_field_number(fresh_comments, fresh_ticket.get("requester_id")) != number):
         return False
     updated_at = fresh_ticket.get("updated_at")
     if not updated_at:
@@ -557,7 +558,7 @@ def classify_origin(ticket: Dict[str, Any], comments: List[Dict[str, Any]]) -> s
     """
     Ritorna: 'shopify' | 'amazon_qr' | 'generic_email'
     Regole:
-      - Shopify: via.source.rel == 'shopify' OPPURE corpo contiene la frase tipica del form.
+      - Shopify: form/integration or an unambiguous 4-6 digit / ERP order reference.
       - Amazon QR (certo): subject contiene uno dei AMAZON_SUBJECT_TOKENS
                            OPPURE compare un ordine Amazon nel testo.
       - Se si cita Amazon genericamente senza questi indizi -> generic_email (chiedere info e decidere dopo).
@@ -575,18 +576,43 @@ def classify_origin(ticket: Dict[str, Any], comments: List[Dict[str, Any]]) -> s
 
     if any(tok in subject for tok in AMAZON_SUBJECT_TOKENS):
         return "amazon_qr"
+
+    if shopify_order_for_ticket(ticket, comments):
+        return "shopify"
     if ORDER_PAT.search(thread_text):
         return "amazon_qr"
 
     return "generic_email"
 
-def tag_origin(ticket_id: int, origin: str):
-    if origin == "shopify":
-        ensure_tags(ticket_id, ["source_shopify_form"])
-    elif origin == "amazon_qr":
-        ensure_tags(ticket_id, ["source_amazon_qr"])
-    else:
-        ensure_tags(ticket_id, ["source_generic_email"])
+def shopify_order_for_ticket(ticket: Dict[str, Any], comments: List[Dict[str, Any]]) -> Optional[str]:
+    number = (get_custom_field_value(ticket, Z_ORDER_FIELD)
+              or customer_order_field_number(comments, ticket.get("requester_id")))
+    return shopify_erp_number(number)
+
+
+def tag_origin(ticket_id: int):
+    """Recompute from fresh evidence; preserve other tags with an optimistic update."""
+    fresh = fetch_ticket(ticket_id)
+    if fresh.get("status") == "closed":
+        return False
+    comments = get_ticket_comments(ticket_id)
+    origin = classify_origin(fresh, comments)
+    is_shopify_order = origin == "shopify" and bool(shopify_order_for_ticket(fresh, comments))
+    source_tag = ("source_shopify_order" if is_shopify_order else
+                  "source_shopify_form" if origin == "shopify" else
+                  "source_amazon_qr" if origin == "amazon_qr" else "source_generic_email")
+    existing = set(fresh.get("tags") or [])
+    target = existing | {source_tag}
+    if is_shopify_order:
+        target.discard("source_generic_email")
+    if target == existing:
+        return False
+    if not fresh.get("updated_at"):
+        raise ValueError(f"Ticket {ticket_id} has no updated_at for safe source tagging")
+    z_put(f"/tickets/{ticket_id}.json", {"ticket": {
+        "tags": sorted(target), "safe_update": True, "updated_stamp": fresh["updated_at"],
+    }})
+    return True
 
 # ============ OPENAI ============
 client = None
@@ -1219,7 +1245,7 @@ def compose_openai_draft(ticket: Dict[str, Any], comments: List[Dict[str, Any]])
     first_name = (extract_first_name_from_shopify_body(public_comments) if origin_hint == "shopify" else None)
     first_name = first_name or get_user_first_name(ticket.get("requester_id"))
     order_number = (get_custom_field_value(ticket, Z_ORDER_FIELD)
-                    or customer_order_number(public_comments, ticket.get("requester_id")))
+                    or customer_order_field_number(public_comments, ticket.get("requester_id")))
     decision = collaboration_decision(ticket)
     if decision:
         return generate_collaboration_draft(
@@ -1646,8 +1672,7 @@ def process_once():
             except Exception as e:
                 print(f"[WARN] collaboration classification fail {t.get('id')}: {e}")
         try:
-            origin = classify_origin(full, comments)
-            tag_origin(full["id"], origin)
+            tag_origin(full["id"])
         except Exception as e:
             print(f"[WARN] origin tag fail {t.get('id')}: {e}")
 

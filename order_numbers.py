@@ -12,12 +12,49 @@ LABELED_ORDER_PAT = re.compile(
 AMAZON_LIKE_PAT = re.compile(
     r"(?<!\d)(\d{2,4})-[ \t]*(?:\r?\n[ \t]*){0,2}(\d{5,9})-"
     r"[ \t]*(?:\r?\n[ \t]*){0,2}(\d{3,9})\b(?!-\d)")
+SHOPIFY_ERP_PREFIX = "3325573-"
+SHOPIFY_ERP_PAT = re.compile(r"(?<![\w-])3325573-([0-9]{4,6})(?![\w-])")
+SHORT_ORDER_PAT = re.compile(r"#?([0-9]{4,6})")
+BARE_ORDER_PAT = re.compile(r"\s*#?([0-9]{4,6})[.!]?\s*")
+ORDER_REQUEST_PAT = re.compile(r"\border\s*(?:number|no\.?|id)\b", re.I)
+REQUEST_CUE_PAT = re.compile(r"\b(?:send|share|provide|resend|confirm|what|have|need)\b|\?", re.I)
+ORDER_LIST_TAIL_PAT = re.compile(
+    r"\s*(?:[,/&]|\bor\b|\band\b)\s*(#?[0-9]{4,6})(?![\w.-])", re.I)
+
+
+def shopify_erp_number(number):
+    """Map the 4-6 digit storefront reference to ERP format, exactly once."""
+    number = str(number or "").strip()
+    if SHOPIFY_ERP_PAT.fullmatch(number):
+        return number
+    match = SHORT_ORDER_PAT.fullmatch(number)
+    return SHOPIFY_ERP_PREFIX + match.group(1) if match else None
 
 
 def order_numbers_in_message(text):
-    found = ["-".join(m.groups()) for m in ORDER_PAT.finditer(text or "")]
-    found.extend(m.group(1) for m in LABELED_ORDER_PAT.finditer(text or ""))
-    return list(dict.fromkeys(found))
+    text = text or ""
+    found = ["-".join(m.groups()) for m in ORDER_PAT.finditer(text)]
+    erp_matches = list(SHOPIFY_ERP_PAT.finditer(text))
+    labeled_matches = list(LABELED_ORDER_PAT.finditer(text))
+    found.extend(m.group(0) for m in erp_matches)
+    found.extend(m.group(1) for m in labeled_matches)
+    # Do not choose the first item from "Order #1893 or #1894".
+    for match in erp_matches + labeled_matches:
+        number = match.group(0) if match.re is SHOPIFY_ERP_PAT else match.group(1)
+        if not shopify_erp_number(number):
+            continue
+        end = match.end()
+        while True:
+            following = ORDER_LIST_TAIL_PAT.match(text, end)
+            if not following:
+                break
+            found.append(following.group(1))
+            end = following.end()
+    # Short and already-prefixed references to the SAME order are not ambiguous.
+    unique = {}
+    for number in found:
+        unique.setdefault(shopify_erp_number(number) or number, number)
+    return list(unique.values())
 
 
 def malformed_amazon_numbers(text):
@@ -27,17 +64,43 @@ def malformed_amazon_numbers(text):
                 if tuple(map(len, m.groups())) != (3, 7, 7)))
 
 
-def customer_order_number(comments, requester_id):
-    for comment in reversed(comments):
-        if not comment.get("public") or comment.get("author_id") != requester_id:
+def _customer_order_candidates(comments, requester_id):
+    public = [c for c in comments if c.get("public")]
+    for index in range(len(public) - 1, -1, -1):
+        comment = public[index]
+        if comment.get("author_id") != requester_id:
             continue
         body = comment.get("body") or ""
         numbers = order_numbers_in_message(body)
         malformed = malformed_amazon_numbers(body)
+        previous = public[index - 1] if index else {}
+        prior_body = previous.get("body") or ""
+        bare = BARE_ORDER_PAT.fullmatch(body)
+        if not numbers and bare and (body.strip().startswith("#") or (
+                previous.get("author_id") != requester_id
+                and ORDER_REQUEST_PAT.search(prior_body)
+                and REQUEST_CUE_PAT.search(prior_body))):
+            numbers = [bare.group(1)]
+        # A short reference explicitly presented as Amazon is NOT a Shopify order.
+        if numbers and all(SHORT_ORDER_PAT.fullmatch(n) for n in numbers) and (
+                re.search(r"\bamazon\b", body, re.I) or (
+                    bare and re.search(r"\bamazon\b", prior_body, re.I))):
+            malformed.extend(numbers)
+            numbers = []
         if numbers or malformed:
             # A later incomplete/corrected identifier must not resurrect an old one.
-            return numbers[0] if len(numbers) == 1 and not malformed else None
-    return None
+            return numbers, malformed
+    return [], []
+
+
+def customer_order_number(comments, requester_id):
+    numbers, malformed = _customer_order_candidates(comments, requester_id)
+    return numbers[0] if len(numbers) == 1 and not malformed else None
+
+
+def customer_order_field_number(comments, requester_id):
+    number = customer_order_number(comments, requester_id)
+    return shopify_erp_number(number) or number
 
 
 def order_number_validation(comments, requester_id, supplied_number=None):
@@ -51,14 +114,7 @@ def order_number_validation(comments, requester_id, supplied_number=None):
             return {"status": "provided_unverified", "number": supplied_number,
                     "requires_customer_correction": False, "malformed_candidates": []}
     if not malformed:
-        for comment in reversed(comments):
-            if not comment.get("public") or comment.get("author_id") != requester_id:
-                continue
-            body = comment.get("body") or ""
-            numbers = order_numbers_in_message(body)
-            malformed = malformed_amazon_numbers(body)
-            if numbers or malformed:
-                break
+        numbers, malformed = _customer_order_candidates(comments, requester_id)
     status = ("malformed_amazon" if malformed else
               "ambiguous" if len(numbers) > 1 else
               "provided_unverified" if numbers else "missing")
