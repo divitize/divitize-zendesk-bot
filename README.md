@@ -58,6 +58,59 @@ and tracking behavior are otherwise unchanged.
 
 New settings:
 
+### Optional 17TRACK shipment-status lookups (private notes only)
+
+`TRACK17_ENABLED=true` and secret `TRACK17_API_KEY` enable standard V2.4 API
+lookups when a customer asks about shipping and a public conversation contains
+an explicit tracking reference. Defaults off. Configure the key only in Render's
+secret environment settings, never in code, chat, notes, model input or logs.
+Only the tracking number (and the API-returned carrier when applicable) is sent;
+no customer email/name/address or order number is transmitted to 17TRACK.
+
+The adapter reads registered tracking first. A number is registered only if the
+API explicitly reports it unregistered and a quota check shows usable credit.
+It does not purchase quota or call paid real-time refresh/translation/notification
+routes. Standard registrations consume account quota; this is not an unlimited
+free service. Stop new registrations at zero quota; previously registered numbers
+can still be read. Carrier autodetection is not infallible: multiple matches and
+errors go to human review instead of an invented status.
+
+Results are passed to the existing single Sol medium call as separate carrier
+evidence, then appended deterministically under AGENT NOTES in the private draft.
+No original/customer tracking is ever written to a custom field. The existing
+replacement tracking field, public tracking announcement, solved status and
+duplicate guards are untouched. A recent public replacement announcement is
+used instead of an older shipment reference when relevant. Preview/pilot runs
+cannot register or query shipments even when production environment is copied.
+
+For returned-to-sender shipments, explain the reported return, apologise, and
+move to replacement resolution. Do not invent the return cause or confuse it
+with delivery to the customer. Distinguish returning from returned. If a
+replacement is already arranged (public agent confirmation or an entered
+replacement shipment reference), the approved illustrative wording is:
+"We've now arranged a replacement for you, and we'll send its tracking details
+in a separate update." Do not promise a second replacement, claim dispatch, or
+invent an ETA. Without that evidence, offer to arrange one; request an order ID
+only if still needed to identify the original order. Ordinary exceptions and
+delivered-but-not-received disputes require contextual human review.
+
+Initial carrier results may take time. For pending first results, defer drafting
+and retry through normal polling for up to five minutes; after that, provide an
+unverified context for manual review, not a false checked-status claim. In-memory
+cache limits repeated API reads (30 seconds pending / 10 minutes other outcomes),
+while 17TRACK retains registration idempotence across restarts. No continuous
+webhook/monitor service or historical draft backfill is enabled. Render must be
+awake for normal polling; existing drafts, including manually corrected #787,
+are not automatically regenerated.
+
+Before saving a tracking-informed draft, recheck the public transcript,
+requester, order reference and replacement-tracking value. Concurrent edits
+cancel the write. A successful private note still uses the original comment
+marker/tag and safe update, preventing duplicates after retries or restarts.
+
+Offline regression suite:
+`python3 -m unittest -q test_ai_draft.py test_shipment_tracking.py`
+
 - `OPENAI_DRAFTS_ENABLED=true` enables the AI draft path. It defaults to `false`.
 - Draft generation is locked to `gpt-6.1-sol`; `DRAFT_OPENAI_MODEL` environment overrides are ignored. `gpt-6-astra` is blocked by the draft module as an additional safeguard.
 - `DRAFT_REASONING_EFFORT` defaults to `medium`.
