@@ -85,14 +85,22 @@ cannot register or query shipments even when production environment is copied.
 
 For returned-to-sender shipments, explain the reported return, apologise, and
 move to replacement resolution. Do not invent the return cause or confuse it
-with delivery to the customer. Distinguish returning from returned. If a
-replacement is already arranged (public agent confirmation or an entered
-replacement shipment reference), the approved illustrative wording is:
+with delivery to the customer. Distinguish returning from returned. The owner
+has authorized immediate replacement processing when approving/sending a private
+draft for a verified returned original parcel with a usable order reference
+(or an order already located by a public agent). In that case, or if a replacement
+is already arranged, the approved illustrative wording is:
 "We've now arranged a replacement for you, and we'll send its tracking details
-in a separate update." Do not promise a second replacement, claim dispatch, or
-invent an ETA. Without that evidence, offer to arrange one; request an order ID
-only if still needed to identify the original order. Ordinary exceptions and
-delivered-but-not-received disputes require contextual human review.
+in a separate update." A replacement tracking number is not required to draft
+this approved resolution. The agent note reminds the human to process it
+immediately when approving/sending, verify the original order and prevent a
+duplicate replacement; revise before sending if processing cannot proceed.
+This is a replacement decision, not proof of ERP creation, production or dispatch.
+Do not promise a second replacement or invent an ETA. Request an order ID if
+missing, malformed or ambiguous. The standing authorization does not cover
+unverified returns, parcels still returning, other exceptions, creator gifts,
+or a customer asking for another resolution. Those cases retain contextual
+human review. All support replies remain private drafts.
 
 Initial carrier results may take time. For pending first results, defer drafting
 and retry through normal polling for up to five minutes; after that, provide an
