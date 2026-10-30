@@ -102,6 +102,14 @@ unverified returns, parcels still returning, other exceptions, creator gifts,
 or a customer asking for another resolution. Those cases retain contextual
 human review. All support replies remain private drafts.
 
+Support drafts always include a friendly greeting with the customer's known
+first name ("Hi there," if unknown), short separated paragraphs and an English
+"Best, / Noe" closing. Returned-parcel replies follow the owner's concise example:
+say the tracking was checked and the parcel returned, apologise, then confirm
+the approved replacement and separate tracking update. Technical statuses and
+timestamps stay in agent notes unless needed to answer a specific question.
+Avoid report-like wording, unnecessary contrasts and generic policy recaps.
+
 Initial carrier results may take time. For pending first results, defer drafting
 and retry through normal polling for up to five minutes; after that, provide an
 unverified context for manual review, not a false checked-status claim. In-memory

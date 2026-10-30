@@ -223,6 +223,8 @@ class ShipmentTrackingTests(unittest.TestCase):
                       call["instructions"])
         self.assertIn("Do not require a replacement tracking number before drafting this wording", call["instructions"])
         self.assertIn("Process the replacement immediately when approving/sending this reply", call["instructions"])
+        self.assertIn("Always open ordinary support replies, including follow-ups", call["instructions"])
+        self.assertIn("Do not omit the greeting", call["instructions"])
         self.assertIn("Do not guess the reason for the return", call["instructions"])
 
     def test_agent_notes_contain_evidence_but_customer_reply_is_not_rewritten_as_template(self):
