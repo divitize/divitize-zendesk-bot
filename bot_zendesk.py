@@ -12,6 +12,7 @@ from flask import Flask, jsonify
 from openai import OpenAI
 from openai_draft import POLICY_VERSION, generate_draft
 from social_profiles import customer_social_profiles
+from shipment_tracking import tracking_context, tracking_agent_note, TrackingPending
 from order_numbers import (
     ORDER_PAT, LABELED_ORDER_PAT, order_numbers_in_message, customer_order_number,
     order_number_validation, customer_order_field_number, shopify_erp_number,
@@ -32,6 +33,8 @@ DRAFT_OPENAI_MODEL = "gpt-6.1-sol"
 DRAFT_REASONING_EFFORT = os.getenv("DRAFT_REASONING_EFFORT", "medium").strip()
 # Keep new AI drafts off until the separate version is tested and explicitly enabled.
 OPENAI_DRAFTS_ENABLED = os.getenv("OPENAI_DRAFTS_ENABLED", "false").strip().lower() == "true"
+TRACK17_ENABLED = os.getenv("TRACK17_ENABLED", "false").strip().lower() == "true"
+TRACK17_API_KEY = os.getenv("TRACK17_API_KEY", "").strip()
 IS_PULL_REQUEST = os.getenv("IS_PULL_REQUEST", "false").strip().lower() == "true"
 PILOT_PRIVATE_DRAFTS_ENABLED = os.getenv("PILOT_PRIVATE_DRAFTS_ENABLED", "false").strip().lower() == "true"
 PILOT_TICKET_IDS = os.getenv("PILOT_TICKET_IDS", "").strip()
@@ -1251,8 +1254,19 @@ def compose_openai_draft(ticket: Dict[str, Any], comments: List[Dict[str, Any]])
         return generate_collaboration_draft(
             client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT, ticket, comments,
             first_name, decision, collaboration_context(ticket), follow_up=True)
-    return generate_draft(client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT,
-                          ticket, comments, first_name, origin_hint, order_number)
+    # PR/pilot runs must not spend tracking quota, even with copied production env.
+    shipment = tracking_context(comments, ticket.get("requester_id"),
+                                enabled=TRACK17_ENABLED and not IS_PULL_REQUEST,
+                                api_key=TRACK17_API_KEY)
+    replacement = get_custom_field_value(ticket, Z_TRACKING_FIELD) if Z_TRACKING_FIELD else None
+    result = generate_draft(client, DRAFT_OPENAI_MODEL, DRAFT_REASONING_EFFORT,
+                            ticket, comments, first_name, origin_hint, order_number,
+                            shipment_tracking=shipment, replacement_tracking_entered=bool(replacement))
+    if shipment:
+        result["_shipment_tracking"] = shipment
+        result["_shipment_snapshot"] = (ticket.get("requester_id"), public_snapshot(comments),
+                                         replacement, order_number)
+    return result
 
 
 def collaboration_decision(ticket: Dict[str, Any]) -> Optional[str]:
@@ -1491,6 +1505,7 @@ def handle_collaboration_decision(ticket: Dict[str, Any],
 def format_internal_draft(customer_comment_id: int, result: Dict[str, Any]) -> str:
     checks = result.get("facts_to_verify") or []
     checks_text = "\n".join(f"- {item}" for item in checks) if checks else "- None identified"
+    shipment_note = tracking_agent_note(result.get("_shipment_tracking"))
     return (
         f"{draft_marker(customer_comment_id)}\n"
         f"Policy: {POLICY_VERSION} | Route: {result['route']} | "
@@ -1499,6 +1514,7 @@ def format_internal_draft(customer_comment_id: int, result: Dict[str, Any]) -> s
         f"{result['reply'].strip()}\n\n"
         "AGENT NOTES — do not send:\n"
         f"{result['agent_note'].strip()}\n"
+        + (f"\n{shipment_note}\n\n" if shipment_note else "") +
         f"Verify:\n{checks_text}"
     )
 
@@ -1513,6 +1529,13 @@ def post_internal_draft_once(ticket_id: int, customer_comment_id: int,
     """
     fresh_ticket = fetch_ticket(ticket_id)
     fresh_comments = get_ticket_comments(ticket_id)
+    if result.get("_shipment_snapshot") is not None:
+        replacement = get_custom_field_value(fresh_ticket, Z_TRACKING_FIELD) if Z_TRACKING_FIELD else None
+        order_number = (get_custom_field_value(fresh_ticket, Z_ORDER_FIELD)
+                        or customer_order_field_number(fresh_comments, fresh_ticket.get("requester_id")))
+        if result["_shipment_snapshot"] != (fresh_ticket.get("requester_id"),
+                public_snapshot(fresh_comments), replacement, order_number):
+            return False
     if fresh_ticket.get("status") in ("solved", "closed"):
         return False
     decision = collaboration_decision(fresh_ticket)
@@ -1748,6 +1771,8 @@ def process_once():
             result = compose_openai_draft(full, comments)
             if post_internal_draft_once(ticket_id, customer_comment_id, result):
                 print(f"[OK] AI draft created for ticket {ticket_id}, comment {customer_comment_id}")
+        except TrackingPending:
+            print(f"[INFO] Waiting for initial carrier result on ticket {ticket_id}; no draft posted")
         except Exception as e:
             print(f"[ERROR draft] {ticket_id}: {e}")
 
