@@ -110,6 +110,19 @@ the approved replacement and separate tracking update. Technical statuses and
 timestamps stay in agent notes unless needed to answer a specific question.
 Avoid report-like wording, unnecessary contrasts and generic policy recaps.
 
+For a reported missing advertised feature or wrong version, acknowledge the
+specific discrepancy and offer the correct replacement under the existing
+channel policy. This is not a fit/customization/material-availability request.
+For Amazon, the replacement and shipping are free and the received organizer
+need not be returned. Ask for a missing order number to locate the original
+order and ensure the correct version is sent; keep listing/variant verification
+in agent checks. Do not claim the replacement is arranged before the order can
+be found, assume every variant has the feature, invent an accessory-only fix,
+ask for unrelated measurements, or re-request photos already attached. File
+names alone do not mean the model has visually inspected a photo. An explicit
+return/refund preference still follows the existing policy. These instructions
+generalize an owner-reviewed reply; they are not automatic model retraining.
+
 Initial carrier results may take time. For pending first results, defer drafting
 and retry through normal polling for up to five minutes; after that, provide an
 unverified context for manual review, not a false checked-status claim. In-memory
