@@ -110,6 +110,13 @@ the approved replacement and separate tracking update. Technical statuses and
 timestamps stay in agent notes unless needed to answer a specific question.
 Avoid report-like wording, unnecessary contrasts and generic policy recaps.
 
+When the conversation already establishes an Amazon purchase, address the
+customer's order directly: "For your order, the replacement and shipping are
+free." Avoid prefacing the offer with "For Amazon orders" or "Since this is
+an Amazon order". Mention Amazon when needed for a practical step such as
+requesting the order number. Channel uncertainty still needs clarification;
+personal wording does not claim that an order lookup or verification occurred.
+
 For a reported missing advertised feature or wrong version, acknowledge the
 specific discrepancy and offer the correct replacement under the existing
 channel policy. This is not a fit/customization/material-availability request.
