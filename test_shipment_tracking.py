@@ -65,6 +65,24 @@ class ShipmentTrackingTests(unittest.TestCase):
         body = f"Please track this package. Tracking number: {NUMBER}\nhttps://t.17track.net/en#nums={NUMBER}"
         self.assertEqual(tracking.tracking_request([{**MESSAGE, "body": body}], 5)["numbers"], [NUMBER])
 
+    def test_contact_details_followup_looks_up_number_from_original_shipping_email(self):
+        inquiry = {**MESSAGE, "body": "I have not received my purse divider yet. I need it badly.\n"
+                   "On Saturday, Divitize wrote:\nYour order is on the way.\n"
+                   "Carrier tracking number: " + NUMBER}
+        agent = {"id": 72, "author_id": 99, "public": True,
+                 "body": "Could you please confirm your address and provide us with your phone number?"}
+        followup = {**MESSAGE, "id": 73, "body": "123 Example Avenue\nSample City, PA 19000\n215.555.0100"}
+        with patch.object(tracking, "lookup_tracking", return_value={"verified": True}) as lookup:
+            result = tracking.tracking_context([inquiry, agent, followup], 5, True, "fake")
+        lookup.assert_called_once_with(NUMBER, "fake")
+        self.assertEqual(result, {"verified": True, "source_comment_id": inquiry["id"]})
+        for messages in ([inquiry, agent, {**followup, "body": "Thanks!"}],
+                         [inquiry, agent, {**followup, "body": "The insert is 2 cm too short."}],
+                         [{**inquiry, "body": "I would like to change the color.\nOn Saturday, Divitize wrote:\n"
+                           "Track your shipment. Tracking number: " + NUMBER}, agent, followup]):
+            with self.subTest(messages=messages):
+                self.assertIsNone(tracking.tracking_request(messages, 5))
+
     def test_multiple_numbers_are_ambiguous_not_arbitrarily_selected(self):
         body = f"Please check tracking number: {NUMBER}; tracking number: {NEW_NUMBER}"
         candidate = tracking.tracking_request([{**MESSAGE, "body": body}], 5)

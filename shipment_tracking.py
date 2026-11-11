@@ -25,6 +25,15 @@ SHIPPING_INTENT = re.compile(
     r"\b(?:order|shipment|shipping|delivery|parcel|package|arriv\w*|receiv\w*|spedizione|consegna)\b"
     r"|\b(?:parcel|package|shipment|delivery)\b.{0,100}\b(?:status|update|fail\w*|return\w*|not|never)\b", re.I)
 BARE_NUMBER = re.compile(r"\s*(" + NUMBER + r")[.!]?\s*")
+CONTACT_REQUEST = re.compile(
+    r"\b(?:confirm|provide|share|send|verify)\b[^\n?]{0,100}"
+    r"\b(?:address|phone(?: number)?|telephone|mobile number)\b", re.I)
+CONTACT_REPLY = re.compile(
+    r"^[ \t]*(?:(?:(?:my|the|shipping|delivery|mailing)\s+)*"
+    r"(?:address|(?:phone|mobile|telephone)(?: number)?)\s*(?::|is\b)"
+    r"|\+?\(?\d{2,4}\)?[ .-]+\d{2,4}[ .-]+\d{3,5}[ \t]*$"
+    r"|\d{1,6}[ \t]+[^\n]{1,70}\b(?:street|st|avenue|ave|road|rd|drive|dr|"
+    r"boulevard|blvd|lane|ln|way|court|ct)\b)", re.I | re.M)
 _cache = {}
 _pending = {}
 _lock = threading.Lock()
@@ -39,6 +48,11 @@ def _valid_number(number):
     return bool(re.fullmatch(NUMBER, number or "") and re.search(r"\d", number))
 
 
+def _unquoted_text(body):
+    return re.split(r"(?im)^\s*(?:On .{0,200}wrote:|From:|-----Original Message-----)",
+                    body, maxsplit=1)[0]
+
+
 def tracking_request(comments, requester_id):
     """Find an explicit reference in public text, including quoted shipping emails.
 
@@ -49,9 +63,15 @@ def tracking_request(comments, requester_id):
     customer = next((c for c in reversed(public) if c.get("author_id") == requester_id), {})
     latest_body = customer.get("body") or ""
     # Quoted shipment notifications supply a number, not the current intent.
-    current_text = re.split(r"(?im)^\s*(?:On .{0,200}wrote:|From:|-----Original Message-----)",
-                            latest_body, maxsplit=1)[0]
-    if not SHIPPING_INTENT.search(current_text) and not (
+    current_text = _unquoted_text(latest_body)
+    # A reply supplying requested contact details continues the delivery inquiry.
+    contact_followup = (len(public) >= 3 and public[-1] is customer
+                        and public[-2].get("author_id") != requester_id
+                        and public[-3].get("author_id") == requester_id
+                        and CONTACT_REQUEST.search(_unquoted_text(public[-2].get("body") or ""))
+                        and CONTACT_REPLY.search(current_text)
+                        and SHIPPING_INTENT.search(_unquoted_text(public[-3].get("body") or "")))
+    if not SHIPPING_INTENT.search(current_text) and not contact_followup and not (
             BARE_NUMBER.fullmatch(latest_body) and len(public) > 1
             and public[-2].get("author_id") != requester_id
             and re.search(r"\btracking\s*(?:number|id|code)\b", public[-2].get("body") or "", re.I)):
